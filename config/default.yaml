@@ -1,0 +1,237 @@
+# Single config file driving a full run: which datasets, which architecture
+# variant, which training stages, and every hyperparameter. Override
+# individual keys from the CLI (see training/run.py --set a.b.c=value)
+# rather than forking this file per experiment.
+#
+# `data.*` (active_datasets, label_mapping, split, etc.) is a near-identical
+# port of moe_nids/config/default.yaml -- the harmonization/label pipeline is
+# reused unchanged. What's new here is `architecture` gaining dataset-expert
+# variants and the `training.stage_c` gate-supervision block.
+
+run_name: dataset_moe_nids_default
+seed: 0
+
+data:
+  # Any subset of data/registry.py's DATASET_REGISTRY keys. Every module
+  # (registry, harmonizer, DatasetExpertBank sizing, training, evaluation)
+  # derives its dataset list from this single field -- reducing it to 2-3
+  # datasets for fast iteration requires zero code changes.
+  active_datasets:
+    - NF-UNSW-NB15-v3
+    - NF-CICIDS2018-v3
+    - NF-BoT-IoT-v3
+    - CSE-CIC-IDS2018
+    - UNSW-NB15-train-test
+    - CICIDS2017
+    - CICIoT2023
+
+  # Full canonical attack-class vocabulary (shared taxonomy across all
+  # datasets, same list as moe_nids). Unlike moe_nids, this project does NOT
+  # give each class its own expert -- dataset-experts each predict over this
+  # entire vocabulary (+ Benign) directly, no per-class relabeling.
+  active_classes:
+    - DoS
+    - DDoS
+    - Reconnaissance
+    - Exploits
+    - Fuzzers
+    - Generic
+    - Backdoor
+    - Shellcode
+    - Analysis
+    - Worms
+    - Theft
+    - Botnet
+    - BruteForce
+    - WebAttack
+    - Infiltration
+    - Spoofing
+    - Mirai
+    - Heartbleed
+
+  # Raw-label -> canonical-class taxonomy, PER DATASET. Ported unchanged from
+  # moe_nids/config/default.yaml -- see data/loaders.py::harmonize_label.
+  label_mapping:
+    NF-BoT-IoT-v3:
+      DoS: DoS
+      DDoS: DDoS
+      Reconnaissance: Reconnaissance
+      Theft: Theft
+
+    NF-CICIDS2018-v3:
+      DDOS_attack-HOIC: DDoS
+      DDoS_attacks-LOIC-HTTP: DDoS
+      DDOS_attack-LOIC-UDP: DDoS
+      DoS_attacks-Hulk: DoS
+      DoS_attacks-GoldenEye: DoS
+      DoS_attacks-Slowloris: DoS
+      DoS_attacks-SlowHTTPTest: DoS
+      Bot: Botnet
+      FTP-BruteForce: BruteForce
+      SSH-Bruteforce: BruteForce
+      Infilteration: Infiltration
+      Brute_Force_-Web: WebAttack
+      Brute_Force_-XSS: WebAttack
+      SQL_Injection: WebAttack
+
+    NF-UNSW-NB15-v3:
+      Exploits: Exploits
+      Fuzzers: Fuzzers
+      Generic: Generic
+      Reconnaissance: Reconnaissance
+      DoS: DoS
+      Backdoor: Backdoor
+      Shellcode: Shellcode
+      Analysis: Analysis
+      Worms: Worms
+
+    UNSW-NB15-train-test:
+      Generic: Generic
+      Exploits: Exploits
+      Fuzzers: Fuzzers
+      DoS: DoS
+      Reconnaissance: Reconnaissance
+      Analysis: Analysis
+      Backdoor: Backdoor
+      Shellcode: Shellcode
+      Worms: Worms
+
+    CSE-CIC-IDS2018:
+      DDOS attack-HOIC: DDoS
+      DoS attacks-Hulk: DoS
+      Bot: Botnet
+      FTP-BruteForce: BruteForce
+      SSH-Bruteforce: BruteForce
+      Infilteration: Infiltration
+      DoS attacks-SlowHTTPTest: DoS
+      DoS attacks-GoldenEye: DoS
+      DoS attacks-Slowloris: DoS
+      DDOS attack-LOIC-UDP: DDoS
+      Brute Force -Web: WebAttack
+      Brute Force -XSS: WebAttack
+      SQL Injection: WebAttack
+      Label: null  # stray header-row-leaked-into-data artifact -- excluded
+
+    CICIDS2017:
+      DoS Hulk: DoS
+      PortScan: Reconnaissance
+      DDoS: DDoS
+      DoS GoldenEye: DoS
+      FTP-Patator: BruteForce
+      SSH-Patator: BruteForce
+      DoS slowloris: DoS
+      DoS Slowhttptest: DoS
+      Bot: Botnet
+      Web Attack Brute Force: WebAttack
+      Web Attack XSS: WebAttack
+      Web Attack Sql Injection: WebAttack
+      "Web Attack � Brute Force": WebAttack
+      "Web Attack � XSS": WebAttack
+      "Web Attack � Sql Injection": WebAttack
+      Heartbleed: Heartbleed
+
+    CICIoT2023:
+      DDoS-ICMP_Flood: DDoS
+      DDoS-UDP_Flood: DDoS
+      DDoS-TCP_Flood: DDoS
+      DDoS-PSHACK_FLOOD: DDoS
+      DDoS-SYN_Flood: DDoS
+      DDoS-RSTFINFLOOD: DDoS
+      DDoS-SynonymousIP_Flood: DDoS
+      DDoS-ICMP_Fragmentation: DDoS
+      DDoS-UDP_Fragmentation: DDoS
+      DDoS-ACK_Fragmentation: DDoS
+      DDoS-HTTP_Flood: DDoS
+      DDoS-SlowLoris: DDoS
+      DoS-UDP_Flood: DoS
+      DoS-TCP_Flood: DoS
+      DoS-SYN_Flood: DoS
+      DoS-HTTP_Flood: DoS
+      Mirai-greeth_flood: Mirai
+      Mirai-udpplain: Mirai
+      Mirai-greip_flood: Mirai
+      VulnerabilityScan: Reconnaissance
+      Recon-HostDiscovery: Reconnaissance
+      Recon-OSScan: Reconnaissance
+      Recon-PortScan: Reconnaissance
+      Recon-PingSweep: Reconnaissance
+      MITM-ArpSpoofing: Spoofing
+      DNS_Spoofing: Spoofing
+      DictionaryBruteForce: BruteForce
+      BrowserHijacking: WebAttack
+      CommandInjection: WebAttack
+      SqlInjection: WebAttack
+      XSS: WebAttack
+      Uploading_Attack: WebAttack
+      Backdoor_Malware: Backdoor
+
+  strict_label_mapping: true
+  max_rows_per_dataset: null
+  divergent_features: []
+  split:
+    train_frac: 0.7
+    val_frac: 0.15
+    test_frac: 0.15
+    min_class_count: 3
+  chunksize: 200000
+  low_sample_threshold: 200
+
+# moe_dataset_soft (primary) | moe_dataset_hard_gate (ablation) |
+# moe_dataset_adapters (ablation) | plain_pooled | no_fusion | hard_two_stage
+architecture: moe_dataset_soft
+
+model:
+  latent_dim: 64
+  encoder:
+    hidden_dims: [256, 128]
+    activation: relu
+    dropout: 0.1
+  # Full independent per-dataset expert head (DatasetExpertBank).
+  expert:
+    hidden_dims: [128, 64]
+    dropout: 0.1
+  # Lightweight FiLM-style adapter alternative (used by moe_dataset_adapters).
+  adapter:
+    rank: 16       # low-rank residual dimension applied to z before the shared head
+    dropout: 0.1
+  gate:
+    hidden_dims: []
+
+load_balance:
+  lambda_balance: 0.1
+
+training:
+  stages: [A, B, C]  # subset of [A, B, C] to run this invocation
+  batch_size: 256
+  min_per_class_per_batch: 4
+  epochs_a: 20
+  epochs_b: 15
+  epochs_c: 20
+  lr: 0.001
+  weight_decay: 0.0
+  freeze_encoder_stage_b: true
+  stage_c_unfreeze: last_layer  # 'last_layer' | 'all' | 'none'
+  # Gate is optimized primarily so the combined task prediction is correct.
+  # "hard" is an explicit ablation/baseline only -- never the recommended
+  # default -- that makes the dataset-ID-aux loss dominant enough to turn
+  # the gate into a de facto dataset classifier, for comparison against
+  # hard_two_stage.
+  stage_c:
+    gate_supervision: light_aux  # none | light_aux | hard
+    lambda_dataset_aux: 0.1      # used when gate_supervision == light_aux
+    lambda_dataset_aux_hard: 5.0 # used when gate_supervision == hard
+  checkpoint_dir: ${OUTPUT_DIR}/checkpoints/${run_name}
+  device: cpu  # 'cpu' | 'cuda' (set via --set training.device=cuda on a GPU box/Colab)
+  checkpoint_every_n_epochs: 1
+  force_restart: false
+
+evaluation:
+  low_sample_threshold: 200
+  bootstrap_n: 1000
+  bootstrap_seed: 0
+  output_dir: ${OUTPUT_DIR}/results/${run_name}
+  # Held-out dataset excluded from active_datasets entirely, used only by
+  # evaluation/ood_ambiguity_eval.py to test soft-mixing vs hard_two_stage
+  # on genuinely out-of-distribution traffic. null = skip that leg of the
+  # OOD eval (nearest-cross-dataset-neighbor leg still runs).
+  ood_holdout_dataset: null

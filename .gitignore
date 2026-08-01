@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+checkpoints/
+results/
+*.egg-info/
+.pytest_cache/
+.local_scratch/
+.DS_Store
+.ipynb_checkpoints/
+.env
+*.pem
+*.key
+NIDS_datasets/
+NIDS_analysis_outputs/
