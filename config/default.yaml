@@ -54,6 +54,8 @@ data:
     - Ransomware
     - Scanning
     - XSS
+    - Bot
+    - WebAttacks
 
   # Raw-label -> canonical-class taxonomy, PER DATASET. Ported unchanged from
   # moe_nids/config/default.yaml -- see data/loaders.py::harmonize_label.
@@ -83,13 +85,13 @@ data:
       DoS_attacks-GoldenEye: DoS
       DoS_attacks-Slowloris: DoS
       DoS_attacks-SlowHTTPTest: DoS
-      Bot: Botnet
+      Bot: Bot
       FTP-BruteForce: BruteForce
       SSH-Bruteforce: BruteForce
       Infilteration: Infiltration
-      Brute_Force_-Web: WebAttack
-      Brute_Force_-XSS: WebAttack
-      SQL_Injection: WebAttack
+      Brute_Force_-Web: WebAttacks
+      Brute_Force_-XSS: WebAttacks
+      SQL_Injection: WebAttacks
 
     NF-UNSW-NB15-v3:
       Exploits: Exploits

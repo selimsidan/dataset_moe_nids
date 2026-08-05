@@ -90,9 +90,11 @@ tests/                       dataset-blind / no-dataset-id-supervision / active-
 ## One-notebook Google Colab run
 
 [`notebooks/00_colab_end_to_end.ipynb`](notebooks/00_colab_end_to_end.ipynb)
-is the canonical start-to-finish Colab workflow. Its single configuration
-cell controls smoke/full mode, datasets, architectures, run name, and resume
-behavior. It securely clones this private repository with a token read from
+is the canonical start-to-finish Colab workflow. It is currently finalized
+for the primary four-way `moe_dataset_soft` comparison against the diagnostic
+project's fixed pooled MLP; its configuration cell exposes execution mode,
+seed, run name, and resume behavior while documenting the locked model choices.
+It securely clones this private repository with a token read from
 Colab Secrets, mounts the shared Drive datasets, runs the tests and full
 training pipeline, evaluates the test split, and displays the tracker CSVs
 persisted to Drive.
@@ -124,6 +126,14 @@ Changing `ACTIVE_DATASETS` in the notebook is sufficient to choose a 2-way,
 architecture, capacity, or training settings change. A signed run contract
 prevents incompatible checkpoints from being reused even if the name is
 accidentally left unchanged.
+
+For the primary four-way comparison, the shared encoder is `47 -> 128 -> 64`,
+matching the dense widths of the diagnostic pooled MLP. The MoE adds four
+linear `64 -> classes` expert heads and a `64 -> 4` soft gate, for about
+20,380 deployed parameters versus about 16,214 in the 22-class diagnostic
+MLP (roughly 1.26x, rather than the earlier nearly 8x mismatch). The primary
+gate is trained from task and load-balancing losses only; dataset-ID auxiliary
+supervision is disabled so it receives no training-time identity advantage.
 
 Detailed full-data reports include combined and per-origin overall metrics,
 exact per-class confusion metrics, the full confusion matrix, mean gate

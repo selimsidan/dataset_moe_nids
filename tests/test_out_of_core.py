@@ -8,6 +8,8 @@ import pandas as pd
 from data import paths
 from data.out_of_core import class_split_quotas, prepare_dataset
 from data.registry import DatasetSpec
+from data.registry import NETFLOW_V3_ALIAS
+from training.config import load_config
 from training.out_of_core_train import shuffled_row_batches
 from training.out_of_core_data import OutOfCoreContext, prepare_out_of_core_data
 from training.dataset import PreparedData, PreparedSplit
@@ -133,3 +135,27 @@ def test_two_way_configuration_builds_logical_pooled_views(tmp_path, monkeypatch
         value.split_rows["train"] for value in context.prepared_by_dataset.values()
     )
     assert context.data.train.dataset_slices["A"].stop == context.data.train.dataset_slices["B"].start
+
+
+def test_four_way_comparison_matches_diagnostic_feature_and_label_contract():
+    expected_tail = [
+        "NUM_PKTS_UP_TO_128_BYTES", "NUM_PKTS_128_TO_256_BYTES",
+        "NUM_PKTS_256_TO_512_BYTES", "NUM_PKTS_512_TO_1024_BYTES",
+        "NUM_PKTS_1024_TO_1514_BYTES", "TCP_WIN_MAX_IN", "TCP_WIN_MAX_OUT",
+        "ICMP_TYPE", "ICMP_IPV4_TYPE", "DNS_QUERY_ID", "DNS_QUERY_TYPE",
+        "DNS_TTL_ANSWER", "FTP_COMMAND_RET_CODE", "SRC_TO_DST_IAT_MIN",
+        "SRC_TO_DST_IAT_MAX", "SRC_TO_DST_IAT_AVG", "SRC_TO_DST_IAT_STDDEV",
+        "DST_TO_SRC_IAT_MIN", "DST_TO_SRC_IAT_MAX", "DST_TO_SRC_IAT_AVG",
+        "DST_TO_SRC_IAT_STDDEV",
+    ]
+    assert len(NETFLOW_V3_ALIAS) == 47
+    assert list(NETFLOW_V3_ALIAS.values())[-len(expected_tail):] == expected_tail
+    config = load_config("config/default.yaml")
+    cse = config["data"]["label_mapping"]["NF-CICIDS2018-v3"]
+    assert cse["Bot"] == "Bot"
+    assert cse["Brute_Force_-Web"] == "WebAttacks"
+    names = ["NF-UNSW-NB15-v3", "NF-ToN-IoT-v3", "NF-BoT-IoT-v3", "NF-CICIDS2018-v3"]
+    classes = {"Benign"}
+    for name in names:
+        classes.update(value for value in config["data"]["label_mapping"][name].values() if value is not None)
+    assert len(classes) == 22
