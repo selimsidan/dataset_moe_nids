@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import time
 
 import numpy as np
 import torch
@@ -58,7 +59,7 @@ def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
         "load_balance": config["load_balance"],
         "training": {
             key: value for key, value in config["training"].items()
-            if key not in {"checkpoint_dir", "device", "force_restart"}
+            if key not in {"checkpoint_dir", "device", "force_restart", "progress_every_rows"}
         },
     }
     contract["signature"] = _hash(contract)
@@ -148,6 +149,29 @@ def _settings(config: dict):
     )
 
 
+def _progress_reporter(tag: str, total_rows: int, every_rows: int):
+    """Return a cheap row-progress callback for long Colab epochs."""
+    started = time.monotonic()
+    next_report = max(1, every_rows)
+
+    def report(rows_seen: int, *, force: bool = False) -> None:
+        nonlocal next_report
+        if not force and rows_seen < next_report:
+            return
+        elapsed = time.monotonic() - started
+        rate = rows_seen / elapsed if elapsed > 0 else 0.0
+        percent = 100.0 * rows_seen / total_rows if total_rows else 100.0
+        print(
+            f"[{tag}] progress={rows_seen:,}/{total_rows:,} ({percent:.1f}%) "
+            f"elapsed={elapsed / 60:.1f}m rate={rate:,.0f} rows/s",
+            flush=True,
+        )
+        while next_report <= rows_seen:
+            next_report += max(1, every_rows)
+
+    return report
+
+
 def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     data = context.data
     device = torch.device(config["training"]["device"])
@@ -174,16 +198,22 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         start_epoch = int(progress["epoch"])
         print(f"[Stage A/ooc] resuming at epoch {start_epoch}")
     batch_size, block_rows, buffer_blocks = _settings(config)
+    progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for epoch in range(start_epoch, int(config["training"]["epochs_a"])):
         rng = np.random.default_rng(config.get("seed", 0) + epoch)
         encoder.train(); probe.train()
         loss_sum = 0.0; rows_seen = 0
+        report_progress = _progress_reporter(
+            f"Stage A/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
+        )
         for row_ids in shuffled_row_batches(0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks):
             features, labels, _ = _batch(data.train, row_ids, device)
             optimizer.zero_grad(set_to_none=True)
             loss = F.cross_entropy(probe(encoder(features)), labels, weight=weights)
             loss.backward(); optimizer.step()
             loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
+            report_progress(rows_seen)
+        report_progress(rows_seen, force=True)
         print(f"[Stage A/ooc] epoch {epoch + 1}: CE={loss_sum / rows_seen:.6f} rows={rows_seen:,}")
         save_progress(checkpoint_dir, "A", {
             "epoch": epoch + 1, "encoder_state": encoder.state_dict(),
@@ -225,6 +255,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         resume_dataset = int(progress["dataset_i"]); resume_epoch = int(progress["epoch"])
         optimizer_state = progress.get("optimizer_state")
     batch_size, block_rows, buffer_blocks = _settings(config)
+    progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for dataset_i, name in enumerate(data.active_datasets):
         if dataset_i < resume_dataset:
             continue
@@ -238,6 +269,10 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         for epoch in range(first_epoch, int(config["training"]["epochs_b"])):
             rng = np.random.default_rng(config.get("seed", 0) + dataset_i * 10_000 + epoch)
             loss_sum = 0.0; rows_seen = 0
+            total_rows = bounds.stop - bounds.start
+            report_progress = _progress_reporter(
+                f"Stage B/ooc:{name} epoch {epoch + 1}", total_rows, progress_every
+            )
             for row_ids in shuffled_row_batches(bounds.start, bounds.stop, rng, batch_size, block_rows, buffer_blocks):
                 features, labels, _ = _batch(data.train, row_ids, device)
                 with torch.no_grad():
@@ -246,6 +281,8 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
                 loss = F.cross_entropy(expert_forward_one(bank, dataset_i, latent), labels, weight=weights)
                 loss.backward(); optimizer.step()
                 loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
+                report_progress(rows_seen)
+            report_progress(rows_seen, force=True)
             print(f"[Stage B/ooc:{name}] epoch {epoch + 1}: CE={loss_sum / rows_seen:.6f} rows={rows_seen:,}")
             save_progress(checkpoint_dir, "B", {
                 "dataset_i": dataset_i, "epoch": epoch + 1,
@@ -340,10 +377,14 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         best_epoch = progress.get("best_epoch")
         patience_left = int(progress.get("patience_left", patience_left))
     batch_size, block_rows, buffer_blocks = _settings(config)
+    progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for epoch in range(start_epoch, int(config["training"]["epochs_c"])):
         rng = np.random.default_rng(config.get("seed", 0) + 100_000 + epoch)
         totals = {"ce": 0.0, "balance": 0.0, "aux": 0.0}; rows_seen = 0
         model.train()
+        report_progress = _progress_reporter(
+            f"Stage C/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
+        )
         for row_ids in shuffled_row_batches(0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks):
             features, labels, dataset_ids = _batch(data.train, row_ids, device)
             output = model(features)
@@ -356,6 +397,8 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
             totals["ce"] += float(ce.item()) * amount
             totals["balance"] += float(balance.item()) * amount
             totals["aux"] += float(aux.item()) * amount
+            report_progress(rows_seen)
+        report_progress(rows_seen, force=True)
         print(
             f"[Stage C/ooc] epoch {epoch + 1}: CE={totals['ce']/rows_seen:.6f} "
             f"balance={totals['balance']/rows_seen:.6f} aux={totals['aux']/rows_seen:.6f} rows={rows_seen:,}"

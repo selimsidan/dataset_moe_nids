@@ -146,14 +146,16 @@ def prepare_out_of_core_data(config: dict) -> OutOfCoreContext:
 
     prepared_by_dataset: dict[str, PreparedDataset] = {}
     for name in names:
+        print(f"[ooc-data] preparing or reusing {name}", flush=True)
         persistent = prepare_dataset(
             specs[name], mapping_catalog[name], feature_columns, data_cfg["split"],
             split_seed, cache_root, chunk_rows, scratch_root,
         )
-        prepared_by_dataset[name] = (
-            stage_dataset(persistent, scratch_root)
-            if data_cfg.get("stage_out_of_core_to_local", True) else persistent
-        )
+        if data_cfg.get("stage_out_of_core_to_local", True):
+            print(f"[ooc-data] staging {name} on local Colab disk", flush=True)
+            prepared_by_dataset[name] = stage_dataset(persistent, scratch_root)
+        else:
+            prepared_by_dataset[name] = persistent
 
     split_signatures = {name: prepared_by_dataset[name].signature for name in names}
     preprocessing_payload = {

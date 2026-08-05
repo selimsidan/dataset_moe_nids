@@ -249,6 +249,9 @@ training:
   shuffle_block_rows: 65536
   shuffle_buffer_blocks: 8
   validation_chunk_rows: 262144
+  # Emit progress during very large disk-backed epochs. Logging only; it does
+  # not affect sampling, optimization, checkpoints, or model results.
+  progress_every_rows: 1000000
   early_stopping_patience: 5
   force_restart: false
 

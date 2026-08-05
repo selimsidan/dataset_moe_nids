@@ -83,7 +83,7 @@ evaluation/
   ood_ambiguity_eval.py        hard_two_stage vs soft-gated MoE on dataset-ambiguous/OOD traffic
   gate_analysis.py             gate weight distribution, expert utilization, collapse check
   report.py                    comparison tables + Trial_ID-keyed tracker CSVs incl. Per_Dataset_Metrics.csv
-notebooks/                   8 Colab-runnable notebooks, one config cell each
+notebooks/                   Colab-runnable workflows, one config cell each
 tests/                       dataset-blind / no-dataset-id-supervision / active-dataset-toggle tests
 ```
 
@@ -103,6 +103,12 @@ In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks
 remain useful for focused diagnostics and individual-stage experimentation.
+
+[`notebooks/09_colab_reduced_warmstart_soft_moe.ipynb`](notebooks/09_colab_reduced_warmstart_soft_moe.ipynb)
+is the faster full-data four-way alternative. It retains mandatory
+dataset-specific Stage B expert warm-starting, but reduces the schedule to
+Stage A = 3, Stage B = 2, and Stage C = at most 30 epochs. Its subprocess is
+unbuffered and reports row progress and elapsed time during long epochs.
 
 ### Full-data 2-way / 3-way / 4-way NF-v3 MoE runs
 
