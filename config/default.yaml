@@ -243,6 +243,13 @@ training:
     gate_supervision: light_aux  # none | light_aux | hard
     lambda_dataset_aux: 0.1      # used when gate_supervision == light_aux
     lambda_dataset_aux_hard: 5.0 # used when gate_supervision == hard
+    # all = conventional joint MoE updates. assigned_only = every row still
+    # uses the full soft mixture, but only its dataset-owned expert receives
+    # an expert-parameter gradient. Dataset-blind inference is unchanged.
+    expert_update_policy: all    # all | assigned_only
+    # Mean squared distance from the Stage-B expert parameters. Zero disables
+    # anchoring; notebook 09 enables a small value for specialization retention.
+    lambda_expert_anchor: 0.0
   checkpoint_dir: ${OUTPUT_DIR}/checkpoints/${run_name}
   device: cpu  # 'cpu' | 'cuda' (set via --set training.device=cuda on a GPU box/Colab)
   checkpoint_every_n_epochs: 1

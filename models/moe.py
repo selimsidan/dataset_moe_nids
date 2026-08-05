@@ -54,9 +54,48 @@ class MoEDatasetNIDS(nn.Module):
         return {
             "z": z,
             "expert_logits": expert_logits,
+            "expert_probs": expert_probs,
             "gate_weights": gate_weights,
             "combined_probs": combined_probs,
         }
+
+    @staticmethod
+    def combine_probs_for_training(
+        gate_weights: torch.Tensor,
+        expert_probs: torch.Tensor,
+        dataset_ids: torch.Tensor,
+        expert_update_policy: str = "all",
+    ) -> torch.Tensor:
+        """Combine experts while optionally enforcing dataset ownership.
+
+        ``assigned_only`` leaves the forward probabilities exactly equal to
+        the ordinary soft mixture, but detaches each non-assigned expert on
+        each row. The gate therefore still learns from every expert's output
+        through the final task loss, while expert ``d`` receives data-driven
+        gradients only from rows whose ``dataset_id == d``. Dataset IDs are
+        used only to control the Stage-C backward path; inference remains the
+        dataset-blind one-argument :meth:`forward` path.
+        """
+        if expert_update_policy == "all":
+            routed_probs = expert_probs
+        elif expert_update_policy == "assigned_only":
+            if dataset_ids.ndim != 1 or dataset_ids.shape[0] != expert_probs.shape[0]:
+                raise ValueError("dataset_ids must have shape (batch,)")
+            if gate_weights.shape != expert_probs.shape[:2]:
+                raise ValueError("gate_weights and expert_probs dimensions are incompatible")
+            if dataset_ids.numel() and (
+                int(dataset_ids.min()) < 0 or int(dataset_ids.max()) >= expert_probs.shape[1]
+            ):
+                raise ValueError("dataset_ids contains an expert index outside the active expert bank")
+            assigned = F.one_hot(
+                dataset_ids.to(torch.long), num_classes=expert_probs.shape[1]
+            ).to(torch.bool).unsqueeze(-1)
+            routed_probs = torch.where(assigned, expert_probs, expert_probs.detach())
+        else:
+            raise ValueError(
+                f"Unknown expert_update_policy {expert_update_policy!r}; expected 'all' or 'assigned_only'"
+            )
+        return torch.einsum("bd,bdc->bc", gate_weights, routed_probs)
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward(x)["combined_probs"].argmax(dim=1)

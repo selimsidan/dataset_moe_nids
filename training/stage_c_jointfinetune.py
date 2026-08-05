@@ -6,6 +6,7 @@ encoder per `training.stage_c_unfreeze`, and trains end-to-end with:
     loss = CE(combined_probs, y_class)
          + lambda_dataset_aux * CE(gate_weights, dataset_id)   [see below]
          + lambda_balance     * load_balance_penalty(gate_weights)
+         + lambda_expert_anchor * MSE(experts, stage_b_experts)
 
 `lambda_dataset_aux` and whether the dataset-aux term is even active are
 controlled by `training.stage_c.gate_supervision`:
@@ -18,9 +19,12 @@ controlled by `training.stage_c.gate_supervision`:
                    approximate a real dataset classifier -- never the
                    recommended default, see models/losses.py docstring)
 
-This is the ONLY place ground-truth dataset_id may influence gate training,
-and only ever through this single, explicitly-weighted term -- never as
-`gate_weights`' primary supervision. See
+This is the ONLY place ground-truth dataset_id may directly supervise the
+gate, and only ever through this single, explicitly-weighted term -- never as
+`gate_weights`' primary supervision. With ``expert_update_policy`` set to
+``assigned_only``, dataset IDs additionally mask the backward path into the
+expert bank, but do not change mixture values or the gate's task-loss gradient.
+See
 tests/test_no_dataset_id_supervision.py for the structural check that
 `gate_supervision: none` truly removes dataset_id from the gate's
 computation graph.
@@ -74,6 +78,24 @@ def _lambda_dataset_aux(config: dict) -> float:
     raise ValueError(f"Unknown training.stage_c.gate_supervision '{mode}'. Expected none | light_aux | hard.")
 
 
+def _expert_anchor(model) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in model.expert_bank.named_parameters()
+    }
+
+
+def _expert_anchor_penalty(model, anchor: dict[str, torch.Tensor]) -> torch.Tensor:
+    values = []
+    parameter_count = 0
+    for name, parameter in model.expert_bank.named_parameters():
+        values.append((parameter - anchor[name]).square().sum())
+        parameter_count += parameter.numel()
+    if not values or parameter_count == 0:
+        raise ValueError("expert bank has no parameters to anchor")
+    return torch.stack(values).sum() / parameter_count
+
+
 def build_model_from_checkpoints(config: dict, data: PreparedData, device: torch.device) -> MoEDatasetNIDS:
     model_cfg = config["model"]
     checkpoint_dir = config["training"]["checkpoint_dir"]
@@ -98,10 +120,21 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
     torch.manual_seed(config.get("seed", 0))
 
     model = build_model_from_checkpoints(config, data, device)
+    stage_b_anchor = _expert_anchor(model)
     _set_encoder_trainable(model.encoder, config["training"]["stage_c_unfreeze"])
 
     lambda_balance = config["load_balance"]["lambda_balance"]
     lambda_dataset_aux = _lambda_dataset_aux(config)
+    stage_c_cfg = config["training"]["stage_c"]
+    expert_update_policy = stage_c_cfg.get("expert_update_policy", "all")
+    if expert_update_policy not in {"all", "assigned_only"}:
+        raise ValueError("training.stage_c.expert_update_policy must be 'all' or 'assigned_only'")
+    bank_kind = bank_kind_for_architecture(config["architecture"])
+    if expert_update_policy == "assigned_only" and bank_kind != "full":
+        raise ValueError("assigned_only expert updates require independent full experts, not a shared adapter head")
+    lambda_expert_anchor = float(stage_c_cfg.get("lambda_expert_anchor", 0.0))
+    if lambda_expert_anchor < 0:
+        raise ValueError("training.stage_c.lambda_expert_anchor must be non-negative")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=config["training"]["lr"], weight_decay=config["training"].get("weight_decay", 0.0))
@@ -117,8 +150,6 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
 
     checkpoint_dir = config["training"]["checkpoint_dir"]
     checkpoint_every = config["training"].get("checkpoint_every_n_epochs", 1)
-    bank_kind = bank_kind_for_architecture(config["architecture"])
-
     start_epoch = 0
     progress = load_progress(checkpoint_dir, "C")
     if progress is not None:
@@ -128,17 +159,22 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
         print(f"[Stage C] resuming from epoch {start_epoch} (found existing progress checkpoint)")
 
     for epoch in range(start_epoch, config["training"]["epochs_c"]):
-        totals = {"ce": 0.0, "balance": 0.0, "dataset_aux": 0.0}
+        totals = {"ce": 0.0, "balance": 0.0, "dataset_aux": 0.0, "anchor": 0.0}
         n_batches = 0
         for features, class_idx, dataset_idx in loader:
             features, class_idx, dataset_idx = features.to(device), class_idx.to(device), dataset_idx.to(device)
 
-            out = model(features)  # every expert sees the full batch -- no filtering, ever
-            log_probs = MoEDatasetNIDS.combined_probs_to_log_probs(out["combined_probs"])
+            out = model(features)  # every expert still runs on the full batch
+            training_probs = MoEDatasetNIDS.combine_probs_for_training(
+                out["gate_weights"], out["expert_probs"], dataset_idx, expert_update_policy
+            )
+            log_probs = MoEDatasetNIDS.combined_probs_to_log_probs(training_probs)
             ce = F.nll_loss(log_probs, class_idx)
             balance = load_balance_penalty(out["gate_weights"])
 
             loss = ce + lambda_balance * balance
+            anchor = _expert_anchor_penalty(model, stage_b_anchor) if lambda_expert_anchor > 0 else ce.new_zeros(())
+            loss = loss + lambda_expert_anchor * anchor
             aux_value = 0.0
             if lambda_dataset_aux > 0.0:
                 aux = dataset_aux_loss(out["gate_weights"], dataset_idx)
@@ -152,11 +188,13 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
             totals["ce"] += ce.item()
             totals["balance"] += balance.item()
             totals["dataset_aux"] += aux_value
+            totals["anchor"] += anchor.item()
             n_batches += 1
         print(
             f"[Stage C] epoch {epoch}: "
             f"CE={totals['ce'] / n_batches:.4f} balance={totals['balance'] / n_batches:.4f} "
-            f"dataset_aux={totals['dataset_aux'] / n_batches:.4f} (lambda={lambda_dataset_aux})"
+            f"dataset_aux={totals['dataset_aux'] / n_batches:.4f} anchor={totals['anchor'] / n_batches:.6f} "
+            f"policy={expert_update_policy} (dataset_aux_lambda={lambda_dataset_aux}, anchor_lambda={lambda_expert_anchor})"
         )
 
         if (epoch + 1) % checkpoint_every == 0:

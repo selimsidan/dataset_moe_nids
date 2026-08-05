@@ -89,19 +89,28 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path):
         "training": {
             "device": "cpu", "batch_size": 16, "epochs_a": 1, "epochs_b": 1, "epochs_c": 1,
             "lr": 0.001, "weight_decay": 0.0, "stage_c_unfreeze": "all",
-            "stage_c": {"gate_supervision": "none", "lambda_dataset_aux": 0.1, "lambda_dataset_aux_hard": 5.0},
+            "stage_c": {
+                "gate_supervision": "none", "lambda_dataset_aux": 0.1,
+                "lambda_dataset_aux_hard": 5.0,
+                "expert_update_policy": "assigned_only", "lambda_expert_anchor": 0.0001,
+            },
             "checkpoint_dir": str(tmp_path / "checkpoints"), "stages": ["A", "B", "C"],
             "shuffle_block_rows": 16, "shuffle_buffer_blocks": 2,
         },
         "evaluation": {"output_dir": str(tmp_path / "results"), "prediction_chunk_rows": 8},
     }
     contract = ensure_run_contract(config, context)
+    assert contract["training"]["stage_c"]["expert_update_policy"] == "assigned_only"
+    assert contract["training"]["stage_c"]["lambda_expert_anchor"] == 0.0001
     run_stage_a_ooc(config, context)
     run_stage_b_ooc(config, context)
     model = run_stage_c_ooc(config, context)
     reports = evaluate_and_report_ooc(model, context, config, contract)
     assert set(reports["overall"]["origin"]) == {"A", "B", "ALL"}
+    assert len(reports["expert_performance"]) == 4
+    assert reports["expert_performance"]["is_assigned_expert"].sum() == 2
     assert (tmp_path / "results" / "Per_Class_Metrics.csv").is_file()
+    assert (tmp_path / "results" / "Expert_Performance_By_Dataset.csv").is_file()
 
 
 def test_two_way_configuration_builds_logical_pooled_views(tmp_path, monkeypatch):

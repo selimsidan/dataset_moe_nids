@@ -109,6 +109,10 @@ is the faster full-data four-way alternative. It retains mandatory
 dataset-specific Stage B expert warm-starting, but reduces the schedule to
 Stage A = 3, Stage B = 2, and Stage C = at most 30 epochs. Its subprocess is
 unbuffered and reports row progress and elapsed time during long epochs.
+Stage C preserves expert ownership: all four outputs remain in the soft
+mixture, but each row can update only its dataset-assigned expert. The shared
+encoder and dataset-blind gate still learn from the pooled task objective, and
+a small optional Stage-B parameter anchor discourages expert drift.
 
 ### Full-data 2-way / 3-way / 4-way NF-v3 MoE runs
 

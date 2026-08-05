@@ -92,6 +92,7 @@ def evaluate_and_report_ooc(
     num_classes = len(data.class_names)
     num_experts = len(data.active_datasets)
     confusion_by_origin = {}
+    expert_confusion_by_origin = {}
     native_indices_by_origin = {
         origin: {data.class_names.index(label) for label in context.prepared_by_dataset[origin].class_names}
         for origin in data.active_datasets
@@ -106,6 +107,7 @@ def evaluate_and_report_ooc(
         prediction_path = os.path.join(prediction_dir, f"{origin}.npy")
         predictions = np.lib.format.open_memmap(prediction_path, mode="w+", dtype=np.int16, shape=(amount,))
         confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+        expert_confusion = np.zeros((num_experts, num_classes, num_classes), dtype=np.int64)
         gate_sum = np.zeros(num_experts, dtype=np.float64)
         cursor = 0
         with torch.no_grad():
@@ -115,16 +117,23 @@ def evaluate_and_report_ooc(
                 truth = np.asarray(data.test.class_idx[start:stop], dtype=np.int64)
                 output = model(torch.from_numpy(features).to(device, non_blocking=True))
                 prediction = output["combined_probs"].argmax(dim=1).cpu().numpy().astype(np.int16)
+                expert_predictions = output["expert_logits"].argmax(dim=2).cpu().numpy()
                 gates = output["gate_weights"].cpu().numpy()
                 predictions[cursor : cursor + len(prediction)] = prediction
                 confusion += np.bincount(
                     truth * num_classes + prediction, minlength=num_classes * num_classes
                 ).reshape(num_classes, num_classes)
+                for expert_index in range(num_experts):
+                    expert_confusion[expert_index] += np.bincount(
+                        truth * num_classes + expert_predictions[:, expert_index],
+                        minlength=num_classes * num_classes,
+                    ).reshape(num_classes, num_classes)
                 gate_sum += gates.sum(axis=0)
                 utilization += np.bincount(gates.argmax(axis=1), minlength=num_experts)
                 cursor += len(prediction)
         predictions.flush()
         confusion_by_origin[origin] = confusion
+        expert_confusion_by_origin[origin] = expert_confusion
         gate_sum_rows.append({
             "origin": origin, "test_rows": amount,
             **{f"mean_gate__{expert}": float(gate_sum[i] / amount) for i, expert in enumerate(data.active_datasets)},
@@ -152,6 +161,18 @@ def evaluate_and_report_ooc(
     overall = pd.DataFrame(overall_rows)
     per_class = pd.DataFrame(per_class_rows)
     gate = pd.DataFrame(gate_sum_rows)
+    expert_performance_rows = []
+    for origin, expert_confusions in expert_confusion_by_origin.items():
+        for expert_index, expert_name in enumerate(data.active_datasets):
+            expert_performance_rows.append({
+                "origin": origin,
+                "expert": expert_name,
+                "is_assigned_expert": expert_name == origin,
+                **_overall_from_confusion(
+                    expert_confusions[expert_index], native_indices_by_origin[origin]
+                ),
+            })
+    expert_performance = pd.DataFrame(expert_performance_rows)
     utilization_frame = pd.DataFrame([
         {
             "expert": name, "hard_argmax_rows": int(utilization[i]),
@@ -176,6 +197,7 @@ def evaluate_and_report_ooc(
         ("Per_Dataset_Metrics.csv", per_dataset, False),
         ("Per_Class_Metrics.csv", per_class, False),
         ("Gate_By_Dataset.csv", gate, False),
+        ("Expert_Performance_By_Dataset.csv", expert_performance, False),
         ("Expert_Utilization.csv", utilization_frame, False),
         ("Confusion_Matrix.csv", confusion_frame, True),
     ]:
@@ -194,7 +216,8 @@ def evaluate_and_report_ooc(
         "report_files": [
             "Trials.csv", "Overall_Metrics.csv", "Per_Dataset_Metrics.csv",
             "Per_Class_Metrics.csv", "Gate_By_Dataset.csv",
-            "Expert_Utilization.csv", "Confusion_Matrix.csv",
+            "Expert_Performance_By_Dataset.csv", "Expert_Utilization.csv",
+            "Confusion_Matrix.csv",
         ],
     }
     manifest_path = os.path.join(result_dir, "manifest.json")
@@ -204,5 +227,6 @@ def evaluate_and_report_ooc(
     os.replace(temporary, manifest_path)
     return {
         "overall": overall, "per_class": per_class, "gate": gate,
+        "expert_performance": expert_performance,
         "utilization": utilization_frame, "confusion": confusion_frame,
     }

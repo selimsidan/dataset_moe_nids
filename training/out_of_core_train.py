@@ -46,6 +46,19 @@ def _hash(value: dict) -> str:
 
 def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
     checkpoint_dir = config["training"]["checkpoint_dir"]
+    training_contract = {
+        key: copy.deepcopy(value) for key, value in config["training"].items()
+        if key not in {"checkpoint_dir", "device", "force_restart", "progress_every_rows"}
+    }
+    # Preserve compatibility with contracts written before these opt-in
+    # ownership settings existed. Their neutral defaults do not change the
+    # historical Stage-C computation; non-default notebook-09 values remain
+    # part of the signed scientific contract.
+    stage_c_contract = training_contract.get("stage_c", {})
+    if stage_c_contract.get("expert_update_policy", "all") == "all":
+        stage_c_contract.pop("expert_update_policy", None)
+    if float(stage_c_contract.get("lambda_expert_anchor", 0.0)) == 0.0:
+        stage_c_contract.pop("lambda_expert_anchor", None)
     contract = {
         "format_version": 1,
         "execution_mode": "out_of_core_full",
@@ -57,10 +70,7 @@ def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
         "preprocessing_signature": context.preprocessing_signature,
         "model": config["model"],
         "load_balance": config["load_balance"],
-        "training": {
-            key: value for key, value in config["training"].items()
-            if key not in {"checkpoint_dir", "device", "force_restart", "progress_every_rows"}
-        },
+        "training": training_contract,
     }
     contract["signature"] = _hash(contract)
     path = os.path.join(checkpoint_dir, CONTRACT_FILE)
@@ -343,10 +353,30 @@ def _validation_macro_f1(model, split, num_classes: int, device, chunk_rows: int
     return float(f1[support > 0].mean())
 
 
+def _expert_anchor(model) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in model.expert_bank.named_parameters()
+    }
+
+
+def _expert_anchor_penalty(model, anchor: dict[str, torch.Tensor]) -> torch.Tensor:
+    squared_sum = None
+    parameter_count = 0
+    for name, parameter in model.expert_bank.named_parameters():
+        value = (parameter - anchor[name]).square().sum()
+        squared_sum = value if squared_sum is None else squared_sum + value
+        parameter_count += parameter.numel()
+    if squared_sum is None or parameter_count == 0:
+        raise ValueError("expert bank has no parameters to anchor")
+    return squared_sum / parameter_count
+
+
 def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     data = context.data; device = torch.device(config["training"]["device"])
     torch.manual_seed(config.get("seed", 0))
     model = build_ooc_model(config, context, device)
+    stage_b_anchor = _expert_anchor(model)
     _set_encoder_trainable(model.encoder, config["training"]["stage_c_unfreeze"])
     optimizer = torch.optim.Adam(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -354,6 +384,14 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     )
     weights = _loss_weights(data.train.class_idx, len(data.class_names), device)
     stage_cfg = config["training"]["stage_c"]
+    expert_update_policy = stage_cfg.get("expert_update_policy", "all")
+    if expert_update_policy not in {"all", "assigned_only"}:
+        raise ValueError("training.stage_c.expert_update_policy must be 'all' or 'assigned_only'")
+    if expert_update_policy == "assigned_only" and bank_kind_for_architecture(config["architecture"]) != "full":
+        raise ValueError("assigned_only expert updates require independent full experts, not a shared adapter head")
+    anchor_lambda = float(stage_cfg.get("lambda_expert_anchor", 0.0))
+    if anchor_lambda < 0:
+        raise ValueError("training.stage_c.lambda_expert_anchor must be non-negative")
     supervision = stage_cfg.get("gate_supervision", "light_aux")
     aux_lambda = {
         "none": 0.0,
@@ -380,7 +418,7 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for epoch in range(start_epoch, int(config["training"]["epochs_c"])):
         rng = np.random.default_rng(config.get("seed", 0) + 100_000 + epoch)
-        totals = {"ce": 0.0, "balance": 0.0, "aux": 0.0}; rows_seen = 0
+        totals = {"ce": 0.0, "balance": 0.0, "aux": 0.0, "anchor": 0.0}; rows_seen = 0
         model.train()
         report_progress = _progress_reporter(
             f"Stage C/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
@@ -388,20 +426,26 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         for row_ids in shuffled_row_batches(0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks):
             features, labels, dataset_ids = _batch(data.train, row_ids, device)
             output = model(features)
-            ce = F.nll_loss(MoEDatasetNIDS.combined_probs_to_log_probs(output["combined_probs"]), labels, weight=weights)
+            training_probs = MoEDatasetNIDS.combine_probs_for_training(
+                output["gate_weights"], output["expert_probs"], dataset_ids, expert_update_policy
+            )
+            ce = F.nll_loss(MoEDatasetNIDS.combined_probs_to_log_probs(training_probs), labels, weight=weights)
             balance = load_balance_penalty(output["gate_weights"])
             aux = dataset_aux_loss(output["gate_weights"], dataset_ids) if aux_lambda > 0 else ce.new_zeros(())
-            loss = ce + balance_lambda * balance + aux_lambda * aux
+            anchor = _expert_anchor_penalty(model, stage_b_anchor) if anchor_lambda > 0 else ce.new_zeros(())
+            loss = ce + balance_lambda * balance + aux_lambda * aux + anchor_lambda * anchor
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
             amount = len(row_ids); rows_seen += amount
             totals["ce"] += float(ce.item()) * amount
             totals["balance"] += float(balance.item()) * amount
             totals["aux"] += float(aux.item()) * amount
+            totals["anchor"] += float(anchor.item()) * amount
             report_progress(rows_seen)
         report_progress(rows_seen, force=True)
         print(
             f"[Stage C/ooc] epoch {epoch + 1}: CE={totals['ce']/rows_seen:.6f} "
-            f"balance={totals['balance']/rows_seen:.6f} aux={totals['aux']/rows_seen:.6f} rows={rows_seen:,}"
+            f"balance={totals['balance']/rows_seen:.6f} aux={totals['aux']/rows_seen:.6f} "
+            f"anchor={totals['anchor']/rows_seen:.6f} policy={expert_update_policy} rows={rows_seen:,}"
         )
         val_macro_f1 = _validation_macro_f1(
             model, data.val, len(data.class_names), device,
