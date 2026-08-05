@@ -27,19 +27,20 @@ BENIGN_LABEL = "Benign"
 
 
 def assert_active_datasets_consistent(config: dict) -> None:
-    """Fail-loud startup guard (mirrors moe_nids' strict_label_mapping
-    philosophy): every dataset referenced anywhere in `data.label_mapping`
-    must be a subset of `data.active_datasets`. Catches a stale mapping
-    entry left over after narrowing `active_datasets` for a fast-iteration
-    subset run.
+    """Validate active datasets without rejecting mappings kept in the
+    shared config for inactive datasets.
+
+    `data.label_mapping` is a registry-like catalog.  Notebook selection is
+    intentionally just a change to `data.active_datasets`, so extra catalog
+    entries are harmless; missing entries for active datasets are not.
     """
     active = set(config["data"]["active_datasets"])
     mapped = set(config["data"].get("label_mapping", {}) or {})
-    stale = mapped - active
-    if stale:
+    missing = active - mapped
+    if missing:
         raise ValueError(
-            f"data.label_mapping references dataset(s) not in data.active_datasets: {sorted(stale)}. "
-            "Either add them to active_datasets or remove their label_mapping entries."
+            f"Active dataset(s) have no data.label_mapping entry: {sorted(missing)}. "
+            "Add an explicit raw-label mapping before training."
         )
 
 

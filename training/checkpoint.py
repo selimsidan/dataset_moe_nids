@@ -21,10 +21,20 @@ STAGE_C_FILE = "stage_c_full.pt"
 HARMONIZER_FILE = "harmonizer.pkl"
 
 
+def _atomic_torch_save(value, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
 def save_harmonizer(checkpoint_dir: str, harmonizer) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
-    with open(os.path.join(checkpoint_dir, HARMONIZER_FILE), "wb") as f:
+    path = os.path.join(checkpoint_dir, HARMONIZER_FILE)
+    temporary = path + ".tmp"
+    with open(temporary, "wb") as f:
         pickle.dump(harmonizer, f)
+    os.replace(temporary, path)
 
 
 def load_harmonizer(checkpoint_dir: str):
@@ -37,7 +47,7 @@ def load_harmonizer(checkpoint_dir: str):
 
 def save_stage_a(checkpoint_dir: str, encoder_state: dict, class_names: list[str]) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
-    torch.save({"encoder_state": encoder_state, "class_names": class_names}, os.path.join(checkpoint_dir, STAGE_A_FILE))
+    _atomic_torch_save({"encoder_state": encoder_state, "class_names": class_names}, os.path.join(checkpoint_dir, STAGE_A_FILE))
 
 
 def load_stage_a(checkpoint_dir: str) -> dict:
@@ -49,7 +59,7 @@ def load_stage_a(checkpoint_dir: str) -> dict:
 
 def save_stage_b(checkpoint_dir: str, expert_bank_state: dict, dataset_names: list[str], bank_kind: str) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
-    torch.save(
+    _atomic_torch_save(
         {"expert_bank_state": expert_bank_state, "dataset_names": dataset_names, "bank_kind": bank_kind},
         os.path.join(checkpoint_dir, STAGE_B_FILE),
     )
@@ -64,7 +74,7 @@ def load_stage_b(checkpoint_dir: str) -> dict:
 
 def save_stage_c(checkpoint_dir: str, model_state: dict, class_names: list[str], dataset_names: list[str], bank_kind: str) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
-    torch.save(
+    _atomic_torch_save(
         {"model_state": model_state, "class_names": class_names, "dataset_names": dataset_names, "bank_kind": bank_kind},
         os.path.join(checkpoint_dir, STAGE_C_FILE),
     )
@@ -88,7 +98,7 @@ def _progress_path(checkpoint_dir: str, stage: str) -> str:
 
 def save_progress(checkpoint_dir: str, stage: str, state: dict) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
-    torch.save(state, _progress_path(checkpoint_dir, stage))
+    _atomic_torch_save(state, _progress_path(checkpoint_dir, stage))
 
 
 def load_progress(checkpoint_dir: str, stage: str) -> dict | None:

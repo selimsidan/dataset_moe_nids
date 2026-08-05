@@ -102,6 +102,40 @@ Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks
 remain useful for focused diagnostics and individual-stage experimentation.
 
+### Full-data 2-way / 3-way / 4-way NF-v3 MoE runs
+
+The notebook's production `out_of_core_full` mode supports any selection of
+two to four schema-compatible NF-v3 datasets:
+
+- `NF-UNSW-NB15-v3`
+- `NF-ToN-IoT-v3`
+- `NF-BoT-IoT-v3`
+- `NF-CICIDS2018-v3`
+
+It uses the confirmed 47 behavior features shared by these releases while
+excluding IP addresses, ports, and absolute capture timestamps. Every mapped
+row is assigned exactly once to a deterministic, class-stratified signed split
+artifact. Split arrays are globally shuffled on disk, pooled through logical
+views rather than copied, standardized with pooled training statistics only,
+and read in bounded batches during Stage A/B/C and evaluation.
+
+Changing `ACTIVE_DATASETS` in the notebook is sufficient to choose a 2-way,
+3-way, or 4-way combination. Change `RUN_NAME` whenever the combination,
+architecture, capacity, or training settings change. A signed run contract
+prevents incompatible checkpoints from being reused even if the name is
+accidentally left unchanged.
+
+Detailed full-data reports include combined and per-origin overall metrics,
+exact per-class confusion metrics, the full confusion matrix, mean gate
+weights by true dataset origin, expert utilization, and reusable chunked
+prediction files. Prepared splits are reusable across different MoE
+architectures when their data contracts match.
+
+The heterogeneous CICFlowMeter/UNSW/CICIoT datasets remain available to the
+legacy in-memory/smoke pipeline. They are deliberately rejected by the current
+full-data path until official/group-aware split policies and streaming schema
+harmonization are implemented for those multi-file formats.
+
 ## Running a full experiment
 
 ```bash

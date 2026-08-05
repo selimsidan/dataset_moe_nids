@@ -90,8 +90,30 @@ NETFLOW_V3_ALIAS = {
     "dst_to_src_avg_throughput": "DST_TO_SRC_AVG_THROUGHPUT",
     "tcp_win_max_in": "TCP_WIN_MAX_IN",
     "tcp_win_max_out": "TCP_WIN_MAX_OUT",
+    "num_pkts_up_to_128_bytes": "NUM_PKTS_UP_TO_128_BYTES",
+    "num_pkts_128_to_256_bytes": "NUM_PKTS_128_TO_256_BYTES",
+    "num_pkts_256_to_512_bytes": "NUM_PKTS_256_TO_512_BYTES",
+    "num_pkts_512_to_1024_bytes": "NUM_PKTS_512_TO_1024_BYTES",
+    "num_pkts_1024_to_1514_bytes": "NUM_PKTS_1024_TO_1514_BYTES",
+    "icmp_type": "ICMP_TYPE",
+    "icmp_ipv4_type": "ICMP_IPV4_TYPE",
+    "dns_query_id": "DNS_QUERY_ID",
+    "dns_query_type": "DNS_QUERY_TYPE",
+    "dns_ttl_answer": "DNS_TTL_ANSWER",
+    "ftp_command_ret_code": "FTP_COMMAND_RET_CODE",
+    "src_to_dst_iat_min": "SRC_TO_DST_IAT_MIN",
+    "src_to_dst_iat_max": "SRC_TO_DST_IAT_MAX",
+    "src_to_dst_iat_avg": "SRC_TO_DST_IAT_AVG",
+    "src_to_dst_iat_stddev": "SRC_TO_DST_IAT_STDDEV",
+    "dst_to_src_iat_min": "DST_TO_SRC_IAT_MIN",
+    "dst_to_src_iat_max": "DST_TO_SRC_IAT_MAX",
+    "dst_to_src_iat_avg": "DST_TO_SRC_IAT_AVG",
+    "dst_to_src_iat_stddev": "DST_TO_SRC_IAT_STDDEV",
 }
-NETFLOW_V3_DROP = ("IPV4_SRC_ADDR", "L4_SRC_PORT", "IPV4_DST_ADDR", "L4_DST_PORT")
+NETFLOW_V3_DROP = (
+    "IPV4_SRC_ADDR", "L4_SRC_PORT", "IPV4_DST_ADDR", "L4_DST_PORT",
+    "FLOW_START_MILLISECONDS", "FLOW_END_MILLISECONDS",
+)
 
 DATASET_REGISTRY: dict[str, DatasetSpec] = {
     "NF-UNSW-NB15-v3": DatasetSpec(
@@ -103,6 +125,16 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         feature_alias=NETFLOW_V3_ALIAS,
         drop_columns=NETFLOW_V3_DROP,
         notes="NetFlow v3 schema shared with NF-CICIDS2018-v3 / NF-BoT-IoT-v3.",
+    ),
+    "NF-ToN-IoT-v3": DatasetSpec(
+        name="NF-ToN-IoT-v3",
+        kind="file",
+        default_paths=[os.path.join(_paths.DRIVE_BASE, "NF-ToN-IoT-v3", "data", "NF-ToN-IoT-v3.csv")],
+        label_col="Attack",
+        benign_label="Benign",
+        feature_alias=NETFLOW_V3_ALIAS,
+        drop_columns=NETFLOW_V3_DROP,
+        notes="NetFlow v3 schema; raw attack labels are lowercase except Backdoor.",
     ),
     "NF-CICIDS2018-v3": DatasetSpec(
         name="NF-CICIDS2018-v3",

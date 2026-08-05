@@ -38,7 +38,7 @@ def _coerce(value: str):
     except ValueError:
         pass
     if value.startswith("[") and value.endswith("]"):
-        return [v.strip() for v in value[1:-1].split(",") if v.strip()]
+        return [_coerce(v.strip()) for v in value[1:-1].split(",") if v.strip()]
     return value
 
 

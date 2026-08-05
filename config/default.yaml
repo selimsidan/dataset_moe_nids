@@ -48,10 +48,27 @@ data:
     - Spoofing
     - Mirai
     - Heartbleed
+    - Injection
+    - MITM
+    - Password
+    - Ransomware
+    - Scanning
+    - XSS
 
   # Raw-label -> canonical-class taxonomy, PER DATASET. Ported unchanged from
   # moe_nids/config/default.yaml -- see data/loaders.py::harmonize_label.
   label_mapping:
+    NF-ToN-IoT-v3:
+      Backdoor: Backdoor
+      dos: DoS
+      ddos: DDoS
+      injection: Injection
+      mitm: MITM
+      password: Password
+      ransomware: Ransomware
+      scanning: Scanning
+      xss: XSS
+
     NF-BoT-IoT-v3:
       DoS: DoS
       DDoS: DDoS
@@ -174,6 +191,10 @@ data:
     test_frac: 0.15
     min_class_count: 3
   chunksize: 200000
+  # Full-data NF-v3 path: signed disk-backed split creation and staging.
+  split_seed: 0
+  out_of_core_chunk_rows: 200000
+  stage_out_of_core_to_local: true
   low_sample_threshold: 200
 
 # moe_dataset_soft (primary) | moe_dataset_hard_gate (ablation) |
@@ -223,12 +244,17 @@ training:
   checkpoint_dir: ${OUTPUT_DIR}/checkpoints/${run_name}
   device: cpu  # 'cpu' | 'cuda' (set via --set training.device=cuda on a GPU box/Colab)
   checkpoint_every_n_epochs: 1
+  shuffle_block_rows: 65536
+  shuffle_buffer_blocks: 8
+  validation_chunk_rows: 262144
+  early_stopping_patience: 5
   force_restart: false
 
 evaluation:
   low_sample_threshold: 200
   bootstrap_n: 1000
   bootstrap_seed: 0
+  prediction_chunk_rows: 262144
   output_dir: ${OUTPUT_DIR}/results/${run_name}
   # Held-out dataset excluded from active_datasets entirely, used only by
   # evaluation/ood_ambiguity_eval.py to test soft-mixing vs hard_two_stage

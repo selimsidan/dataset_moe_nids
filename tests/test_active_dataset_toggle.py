@@ -12,6 +12,7 @@ from models.adapters import AdapterExpertBank
 from models.dataset_experts import DatasetExpertBank
 from training.checkpoint import load_stage_b, save_stage_b
 from training.model_utils import build_expert_bank, build_model
+from training.dataset import assert_active_datasets_consistent
 
 
 def test_harmonizer_adapts_to_dataset_subset(dataset_specs, synthetic_frames):
@@ -86,3 +87,13 @@ def test_checkpoint_round_trip_preserves_reduced_dataset_subset(tmp_path):
     rebuilt = build_expert_bank("full", ckpt["dataset_names"], latent_dim=8, num_classes=4, model_cfg=_model_cfg())
     rebuilt.load_state_dict(ckpt["expert_bank_state"])
     assert rebuilt.num_experts == len(names)
+
+
+def test_inactive_mapping_catalog_entries_do_not_break_notebook_subset():
+    config = {
+        "data": {
+            "active_datasets": ["A", "B"],
+            "label_mapping": {"A": {}, "B": {}, "C": {}, "D": {}},
+        }
+    }
+    assert_active_datasets_consistent(config)
