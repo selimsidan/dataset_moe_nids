@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+import time
 
 import torch
 
@@ -26,6 +28,7 @@ from .checkpoint import (
     hard_stage_complete,
 )
 from .config import load_config
+from .logging_utils import tee_stdout_to_file
 from .out_of_core_data import prepare_out_of_core_data
 from .hard_two_stage_ooc import (
     load_hard_two_stage_ooc,
@@ -64,6 +67,29 @@ def main() -> None:
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
+    checkpoint_dir = config["training"]["checkpoint_dir"]
+    tee_stdout_to_file(os.path.join(checkpoint_dir, "train.log"))
+    print("\n" + "=" * 80, flush=True)
+    print(f"[ooc-run] started={time.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
+    print(f"[ooc-run] command={' '.join(sys.argv)}", flush=True)
+    print(
+        f"[ooc-run] cuda_available={torch.cuda.is_available()} "
+        f"cuda_device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'}",
+        flush=True,
+    )
+    scratch_dir = os.environ.get("NIDS_SCRATCH_DIR", "/content/dataset_moe_nids_scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+    for label, path in (("checkpoint", checkpoint_dir), ("scratch", scratch_dir)):
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            print(f"[ooc-run] {label}_storage path={path} unavailable: {exc}", flush=True)
+        else:
+            print(
+                f"[ooc-run] {label}_storage path={path} "
+                f"free={usage.free / 2**30:.1f}GiB total={usage.total / 2**30:.1f}GiB",
+                flush=True,
+            )
     if config["architecture"] not in {
         "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
         "moe_dataset_adapters", "moe_basic", "hard_two_stage", "plain_pooled", "matched_dense", "no_fusion",
@@ -71,13 +97,12 @@ def main() -> None:
         raise ValueError("out_of_core_full supports MoE, dense, and hard_two_stage architectures")
     if config["training"].get("device") == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable. Select a GPU Colab runtime.")
-    checkpoint_dir = config["training"]["checkpoint_dir"]
     if config["training"].get("force_restart", False):
         _restart(checkpoint_dir)
 
-    print(f"[ooc-run] python={sys.executable} architecture={config['architecture']}")
-    print(f"[ooc-run] datasets={config['data']['active_datasets']}")
-    print(f"[ooc-run] checkpoint_dir={checkpoint_dir}")
+    print(f"[ooc-run] python={sys.executable} architecture={config['architecture']}", flush=True)
+    print(f"[ooc-run] datasets={config['data']['active_datasets']}", flush=True)
+    print(f"[ooc-run] checkpoint_dir={checkpoint_dir}", flush=True)
     context = prepare_out_of_core_data(config)
     contract = ensure_run_contract(config, context)
     print(f"[ooc-run] contract={contract['signature']} split_signatures={context.split_signatures}")
@@ -175,4 +200,19 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    started = time.monotonic()
+    try:
+        main()
+    except Exception as exc:
+        print(
+            f"[ooc-run] FAILED after {(time.monotonic() - started) / 60:.1f} min: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    else:
+        print(
+            f"[ooc-run] completed successfully in {(time.monotonic() - started) / 60:.1f} min",
+            flush=True,
+        )

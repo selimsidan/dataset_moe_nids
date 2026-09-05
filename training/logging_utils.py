@@ -1,6 +1,8 @@
-"""Tiny stdout-to-file tee, shared by training.run and inference.predict, so
-CLI output survives a Colab disconnect -- inspectable from Drive afterward
-alongside checkpoints, in addition to the live stdout stream."""
+"""Tiny output-to-file tee used by long-running Colab commands.
+
+Both stdout and stderr are persisted so progress messages and uncaught
+tracebacks survive a Colab disconnect while remaining visible live.
+"""
 from __future__ import annotations
 
 import os
@@ -22,5 +24,6 @@ class _Tee:
 
 def tee_stdout_to_file(log_path: str) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    log_file = open(log_path, "a")
+    log_file = open(log_path, "a", buffering=1)
     sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
