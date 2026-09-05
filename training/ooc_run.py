@@ -7,6 +7,9 @@ import shutil
 import sys
 import time
 
+if __name__ == "__main__":
+    print("[ooc-run] child process started; importing training dependencies...", flush=True)
+
 import torch
 
 from evaluation.out_of_core_report import evaluate_and_report_ooc
