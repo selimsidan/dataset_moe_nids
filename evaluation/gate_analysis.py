@@ -37,7 +37,7 @@ def compute_gate_weights(model: MoEDatasetNIDS, features: np.ndarray, batch_size
 def gate_weight_by_true_dataset(gate_weights: np.ndarray, dataset_names: list[str], true_dataset_name: np.ndarray) -> pd.DataFrame:
     """Mean gate weight vector per TRUE source dataset -- a diagonal-heavy
     matrix means the gate mostly recovers dataset identity (expected, but
-    watch for `training.stage_c.gate_supervision: hard` making this
+    watch for `training.stage_c.gate_supervision: hard` or `damex` making this
     trivially true); a more diffuse matrix means the gate is blending
     experts based on task-relevant signal instead of dataset fingerprints.
     """

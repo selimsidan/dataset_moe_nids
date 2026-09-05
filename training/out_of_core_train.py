@@ -21,20 +21,23 @@ from .checkpoint import (
     STAGE_C_FILE,
     clear_progress,
     load_progress,
-    load_stage_a,
+    load_validated_stage_a,
     save_progress,
     save_stage_a,
     save_stage_b,
     save_stage_c,
+    stage_a_metadata,
 )
 from .model_utils import (
     bank_kind_for_architecture,
     build_expert_bank,
     build_model,
     expert_forward_one,
+    expert_names_for_architecture,
     expert_train_params,
 )
 from .out_of_core_data import OutOfCoreContext, class_counts
+from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
 
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
@@ -59,8 +62,22 @@ def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
         stage_c_contract.pop("expert_update_policy", None)
     if float(stage_c_contract.get("lambda_expert_anchor", 0.0)) == 0.0:
         stage_c_contract.pop("lambda_expert_anchor", None)
+    # The dataset warm-start was the historical implicit behavior. Keep old
+    # dataset-MoE contracts reusable while signing the non-default basic-MoE
+    # random initialization mode as a scientifically meaningful difference.
+    stage_b_contract = training_contract.get("stage_b", {})
+    if stage_b_contract.get("warmstart_mode", "dataset") == "dataset":
+        stage_b_contract.pop("warmstart_mode", None)
+    if not stage_b_contract:
+        training_contract.pop("stage_b", None)
+    model_contract = copy.deepcopy(config["model"])
+    # Preserve existing dense-run signatures written before routing became
+    # configurable. Only the non-default sparse choice changes the contract.
+    gate_contract = model_contract.get("gate", {})
+    if gate_contract.get("routing", "dense") == "dense":
+        gate_contract.pop("routing", None)
     contract = {
-        "format_version": 1,
+        "format_version": 2,
         "execution_mode": "out_of_core_full",
         "architecture": config["architecture"],
         "active_datasets": context.data.active_datasets,
@@ -68,7 +85,7 @@ def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
         "feature_columns": context.feature_columns,
         "split_signatures": context.split_signatures,
         "preprocessing_signature": context.preprocessing_signature,
-        "model": config["model"],
+        "model": model_contract,
         "load_balance": config["load_balance"],
         "training": training_contract,
     }
@@ -200,12 +217,17 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     weights = _loss_weights(data.train.class_idx, len(data.class_names), device)
     checkpoint_dir = config["training"]["checkpoint_dir"]
     start_epoch = 0
+    optimizer_steps = 0
+    examples_seen = 0
+    started = time.monotonic()
     progress = load_progress(checkpoint_dir, "A")
     if progress:
         encoder.load_state_dict(progress["encoder_state"])
         probe.load_state_dict(progress["probe_state"])
         optimizer.load_state_dict(progress["optimizer_state"])
         start_epoch = int(progress["epoch"])
+        optimizer_steps = int(progress.get("optimizer_steps", 0))
+        examples_seen = int(progress.get("examples_seen", 0))
         print(f"[Stage A/ooc] resuming at epoch {start_epoch}")
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
@@ -221,6 +243,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             optimizer.zero_grad(set_to_none=True)
             loss = F.cross_entropy(probe(encoder(features)), labels, weight=weights)
             loss.backward(); optimizer.step()
+            optimizer_steps += 1; examples_seen += len(row_ids)
             loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
             report_progress(rows_seen)
         report_progress(rows_seen, force=True)
@@ -228,8 +251,28 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         save_progress(checkpoint_dir, "A", {
             "epoch": epoch + 1, "encoder_state": encoder.state_dict(),
             "probe_state": probe.state_dict(), "optimizer_state": optimizer.state_dict(),
+            "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
         })
-    save_stage_a(checkpoint_dir, encoder.state_dict(), data.class_names)
+    combined_split_signature = _hash(context.split_signatures)
+    metadata = stage_a_metadata(
+        config,
+        data,
+        split_signature=combined_split_signature,
+        feature_columns=context.feature_columns,
+    )
+    metadata["training_summary"] = {
+        "optimizer_steps": optimizer_steps,
+        "examples_seen": examples_seen,
+        "epochs_completed": int(config["training"]["epochs_a"]),
+        "wall_seconds": time.monotonic() - started,
+        "selected_epoch": int(config["training"]["epochs_a"]),
+    }
+    save_stage_a(
+        checkpoint_dir,
+        encoder.state_dict(),
+        data.class_names,
+        metadata=metadata,
+    )
     clear_progress(checkpoint_dir, "A")
     return encoder
 
@@ -241,7 +284,13 @@ def _frozen_encoder(config: dict, context: OutOfCoreContext, device) -> SharedEn
         latent_dim=model_cfg["latent_dim"], activation=model_cfg["encoder"]["activation"],
         dropout=model_cfg["encoder"]["dropout"],
     ).to(device)
-    encoder.load_state_dict(load_stage_a(config["training"]["checkpoint_dir"])["encoder_state"])
+    encoder.load_state_dict(load_validated_stage_a(
+        config,
+        stage_a_metadata(
+            config, data, split_signature=_hash(context.split_signatures),
+            feature_columns=context.feature_columns,
+        ),
+    )["encoder_state"])
     encoder.eval()
     for parameter in encoder.parameters():
         parameter.requires_grad_(False)
@@ -251,19 +300,42 @@ def _frozen_encoder(config: dict, context: OutOfCoreContext, device) -> SharedEn
 def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
     data = context.data; device = torch.device(config["training"]["device"])
     torch.manual_seed(config.get("seed", 0))
-    encoder = _frozen_encoder(config, context, device)
     bank_kind = bank_kind_for_architecture(config["architecture"])
+    expert_names = expert_names_for_architecture(config["architecture"], data.active_datasets)
     bank = build_expert_bank(
-        bank_kind, data.active_datasets, config["model"]["latent_dim"],
+        bank_kind, expert_names, config["model"]["latent_dim"],
         len(data.class_names), config["model"],
     ).to(device)
     checkpoint_dir = config["training"]["checkpoint_dir"]
+    warmstart_mode = config["training"].get("stage_b", {}).get("warmstart_mode", "dataset")
+    if warmstart_mode == "random_init":
+        print(
+            "[Stage B/ooc] basic MoE: saving randomly initialized generic experts; "
+            "no dataset is assigned to or used to warm-start an expert"
+        )
+        save_stage_b(
+            checkpoint_dir, bank.state_dict(), expert_names, bank_kind,
+            training_summary={
+                "optimizer_steps": 0, "examples_seen": 0, "epochs_completed": 0,
+                "wall_seconds": 0.0, "selected_epoch": 0,
+            },
+        )
+        clear_progress(checkpoint_dir, "B")
+        return bank
+    if warmstart_mode != "dataset":
+        raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
+
+    encoder = _frozen_encoder(config, context, device)
     progress = load_progress(checkpoint_dir, "B")
     resume_dataset = 0; resume_epoch = 0; optimizer_state = None
+    optimizer_steps = examples_seen = 0
+    started = time.monotonic()
     if progress:
         bank.load_state_dict(progress["expert_bank_state"])
         resume_dataset = int(progress["dataset_i"]); resume_epoch = int(progress["epoch"])
         optimizer_state = progress.get("optimizer_state")
+        optimizer_steps = int(progress.get("optimizer_steps", 0))
+        examples_seen = int(progress.get("examples_seen", 0))
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for dataset_i, name in enumerate(data.active_datasets):
@@ -290,6 +362,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
                 optimizer.zero_grad(set_to_none=True)
                 loss = F.cross_entropy(expert_forward_one(bank, dataset_i, latent), labels, weight=weights)
                 loss.backward(); optimizer.step()
+                optimizer_steps += 1; examples_seen += len(row_ids)
                 loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
                 report_progress(rows_seen)
             report_progress(rows_seen, force=True)
@@ -297,13 +370,27 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
             save_progress(checkpoint_dir, "B", {
                 "dataset_i": dataset_i, "epoch": epoch + 1,
                 "expert_bank_state": bank.state_dict(), "optimizer_state": optimizer.state_dict(),
+                "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
             })
         # Mark this expert complete before moving to the next one.
         save_progress(checkpoint_dir, "B", {
             "dataset_i": dataset_i + 1, "epoch": 0,
             "expert_bank_state": bank.state_dict(), "optimizer_state": None,
+            "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
         })
-    save_stage_b(checkpoint_dir, bank.state_dict(), data.active_datasets, bank_kind)
+    save_stage_b(
+        checkpoint_dir,
+        bank.state_dict(),
+        expert_names,
+        bank_kind,
+        training_summary={
+            "optimizer_steps": optimizer_steps,
+            "examples_seen": examples_seen,
+            "epochs_completed": int(config["training"]["epochs_b"]),
+            "wall_seconds": time.monotonic() - started,
+            "selected_epoch": int(config["training"]["epochs_b"]),
+        },
+    )
     clear_progress(checkpoint_dir, "B")
     return bank
 
@@ -325,7 +412,13 @@ def build_ooc_model(config: dict, context: OutOfCoreContext, device) -> torch.nn
         latent_dim=model_cfg["latent_dim"], activation=model_cfg["encoder"]["activation"],
         dropout=model_cfg["encoder"]["dropout"],
     ).to(device)
-    encoder.load_state_dict(load_stage_a(config["training"]["checkpoint_dir"])["encoder_state"])
+    encoder.load_state_dict(load_validated_stage_a(
+        config,
+        stage_a_metadata(
+            config, data, split_signature=_hash(context.split_signatures),
+            feature_columns=context.feature_columns,
+        ),
+    )["encoder_state"])
     model = build_model(config["architecture"], encoder, data.active_datasets, data.class_names, model_cfg).to(device)
     from .checkpoint import load_stage_b
     model.expert_bank.load_state_dict(load_stage_b(config["training"]["checkpoint_dir"])["expert_bank_state"])
@@ -393,11 +486,7 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     if anchor_lambda < 0:
         raise ValueError("training.stage_c.lambda_expert_anchor must be non-negative")
     supervision = stage_cfg.get("gate_supervision", "light_aux")
-    aux_lambda = {
-        "none": 0.0,
-        "light_aux": float(stage_cfg.get("lambda_dataset_aux", 0.1)),
-        "hard": float(stage_cfg.get("lambda_dataset_aux_hard", 5.0)),
-    }[supervision]
+    aux_lambda = _lambda_dataset_aux(config)
     balance_lambda = float(config["load_balance"]["lambda_balance"])
     checkpoint_dir = config["training"]["checkpoint_dir"]
     start_epoch = 0
@@ -405,6 +494,11 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     best_model_state = None
     best_epoch = None
     patience_left = int(config["training"].get("early_stopping_patience", 5))
+    selection_mode = config["training"].get("selection_mode", "fixed_epochs")
+    if selection_mode not in {"fixed_epochs", "best_val"}:
+        raise ValueError("training.selection_mode must be fixed_epochs or best_val")
+    optimizer_steps = examples_seen = 0
+    started = time.monotonic()
     progress = load_progress(checkpoint_dir, "C")
     if progress:
         model.load_state_dict(progress["model_state"])
@@ -414,9 +508,13 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         best_model_state = progress.get("best_model_state")
         best_epoch = progress.get("best_epoch")
         patience_left = int(progress.get("patience_left", patience_left))
+        optimizer_steps = int(progress.get("optimizer_steps", 0))
+        examples_seen = int(progress.get("examples_seen", 0))
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
+    completed_epoch = start_epoch
     for epoch in range(start_epoch, int(config["training"]["epochs_c"])):
+        completed_epoch = epoch + 1
         rng = np.random.default_rng(config.get("seed", 0) + 100_000 + epoch)
         totals = {"ce": 0.0, "balance": 0.0, "aux": 0.0, "anchor": 0.0}; rows_seen = 0
         model.train()
@@ -426,15 +524,27 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         for row_ids in shuffled_row_batches(0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks):
             features, labels, dataset_ids = _batch(data.train, row_ids, device)
             output = model(features)
-            training_probs = MoEDatasetNIDS.combine_probs_for_training(
-                output["gate_weights"], output["expert_probs"], dataset_ids, expert_update_policy
-            )
+            task_gate_weights = _gate_weights_for_task(output["gate_weights"], supervision)
+            ownership_ids = dataset_ids if expert_update_policy == "assigned_only" else None
+            if model.routing_mode == "top1":
+                training_probs = MoEDatasetNIDS.combine_top1_for_training(
+                    task_gate_weights,
+                    output["selected_probs"],
+                    output["selected_experts"],
+                    ownership_ids,
+                    expert_update_policy,
+                )
+            else:
+                training_probs = MoEDatasetNIDS.combine_probs_for_training(
+                    task_gate_weights, output["expert_probs"], ownership_ids, expert_update_policy
+                )
             ce = F.nll_loss(MoEDatasetNIDS.combined_probs_to_log_probs(training_probs), labels, weight=weights)
             balance = load_balance_penalty(output["gate_weights"])
             aux = dataset_aux_loss(output["gate_weights"], dataset_ids) if aux_lambda > 0 else ce.new_zeros(())
             anchor = _expert_anchor_penalty(model, stage_b_anchor) if anchor_lambda > 0 else ce.new_zeros(())
             loss = ce + balance_lambda * balance + aux_lambda * aux + anchor_lambda * anchor
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
+            optimizer_steps += 1; examples_seen += len(row_ids)
             amount = len(row_ids); rows_seen += amount
             totals["ce"] += float(ce.item()) * amount
             totals["balance"] += float(balance.item()) * amount
@@ -445,43 +555,63 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         print(
             f"[Stage C/ooc] epoch {epoch + 1}: CE={totals['ce']/rows_seen:.6f} "
             f"balance={totals['balance']/rows_seen:.6f} aux={totals['aux']/rows_seen:.6f} "
-            f"anchor={totals['anchor']/rows_seen:.6f} policy={expert_update_policy} rows={rows_seen:,}"
+            f"anchor={totals['anchor']/rows_seen:.6f} policy={expert_update_policy} "
+            f"gate_supervision={supervision} rows={rows_seen:,}"
         )
-        val_macro_f1 = _validation_macro_f1(
-            model, data.val, len(data.class_names), device,
-            int(config["training"].get("validation_chunk_rows", 262_144)),
-        )
-        improved = val_macro_f1 > best_val_macro_f1 + 1e-12
-        if improved:
-            best_val_macro_f1 = val_macro_f1
-            best_epoch = epoch + 1
-            best_model_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
-            patience_left = int(config["training"].get("early_stopping_patience", 5))
-        else:
-            patience_left -= 1
-        print(
-            f"[Stage C/ooc] epoch {epoch + 1}: val_macro_f1={val_macro_f1:.6f} "
-            f"best={best_val_macro_f1:.6f} patience_left={patience_left}"
-        )
+        if selection_mode == "best_val":
+            val_macro_f1 = _validation_macro_f1(
+                model, data.val, len(data.class_names), device,
+                int(config["training"].get("validation_chunk_rows", 262_144)),
+            )
+            improved = val_macro_f1 > best_val_macro_f1 + 1e-12
+            if improved:
+                best_val_macro_f1 = val_macro_f1
+                best_epoch = epoch + 1
+                best_model_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+                patience_left = int(config["training"].get("early_stopping_patience", 5))
+            else:
+                patience_left -= 1
+            print(
+                f"[Stage C/ooc] epoch {epoch + 1}: val_macro_f1={val_macro_f1:.6f} "
+                f"best={best_val_macro_f1:.6f} patience_left={patience_left}"
+            )
         save_progress(checkpoint_dir, "C", {
             "epoch": epoch + 1, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
             "best_val_macro_f1": best_val_macro_f1, "best_model_state": best_model_state,
             "best_epoch": best_epoch, "patience_left": patience_left,
+            "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
         })
-        if patience_left <= 0:
+        if selection_mode == "best_val" and patience_left <= 0:
             print(f"[Stage C/ooc] early stopping after epoch {epoch + 1}")
             break
-    if best_model_state is not None:
+    if selection_mode == "best_val" and best_model_state is not None:
         model.load_state_dict(best_model_state)
     bank_kind = bank_kind_for_architecture(config["architecture"])
-    save_stage_c(checkpoint_dir, model.state_dict(), data.class_names, data.active_datasets, bank_kind)
+    selected_epoch = best_epoch if selection_mode == "best_val" else completed_epoch
+    summary = {
+        "optimizer_steps": optimizer_steps,
+        "examples_seen": examples_seen,
+        "epochs_completed": completed_epoch,
+        "wall_seconds": time.monotonic() - started,
+        "selected_epoch": selected_epoch,
+    }
+    save_stage_c(
+        checkpoint_dir, model.state_dict(), data.class_names, data.active_datasets,
+        bank_kind, training_summary=summary,
+    )
     summary_path = os.path.join(checkpoint_dir, STAGE_C_SUMMARY_FILE)
     temporary = summary_path + ".tmp"
     with open(temporary, "w") as handle:
         json.dump(
-            {"best_epoch": best_epoch, "best_validation_macro_f1": best_val_macro_f1},
+            {
+                "best_epoch": selected_epoch,
+                "best_validation_macro_f1": best_val_macro_f1 if selection_mode == "best_val" else None,
+                "selection_mode": selection_mode,
+                "training_summary": summary,
+            },
             handle, indent=2, sort_keys=True,
         )
     os.replace(temporary, summary_path)
     clear_progress(checkpoint_dir, "C")
+    model.training_summary = {"C": summary}
     return model

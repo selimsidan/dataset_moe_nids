@@ -1,6 +1,11 @@
-"""Stage B -- Independent dataset-expert warm-start.
+"""Stage B -- selectable expert-bank initialization/warm-start.
 
-Encoder is frozen (loaded from the Stage A checkpoint). Each dataset-expert
+``training.stage_b.warmstart_mode=random_init`` saves a randomly initialized
+generic expert bank without reading dataset membership. This is the native
+``moe_basic`` path: experts and router begin joint task training in Stage C.
+
+With ``warmstart_mode=dataset`` (the unchanged dataset-MoE path), the encoder
+is frozen and each dataset-expert
 is trained independently, on a class-balanced view of ONLY its own
 dataset's rows, against the full task label (no relabeling -- unlike
 moe_nids' per-class target/benign/other relabeling, each dataset-expert
@@ -15,15 +20,25 @@ randomly-initialized ones. Number of experts/datasets trained here is
 """
 from __future__ import annotations
 
+import time
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models.encoder import SharedEncoder
 
-from .checkpoint import clear_progress, load_progress, load_stage_a, save_progress, save_stage_b
+from .checkpoint import (
+    clear_progress, load_progress, load_validated_stage_a, save_progress,
+    save_stage_b, stage_a_metadata,
+)
 from .dataset import HarmonizedTensorDataset, PreparedData
-from .model_utils import bank_kind_for_architecture, build_expert_bank, expert_forward_one, expert_train_params
+from .model_utils import (
+    bank_kind_for_architecture,
+    build_expert_bank,
+    expert_forward_one,
+    expert_names_for_architecture,
+    expert_train_params,
+)
 from .sampler import ClassBalancedBatchSampler
 
 
@@ -48,7 +63,7 @@ class _RemappedBatchSampler:
 
 
 def _build_frozen_encoder(config: dict, data: PreparedData, device: torch.device) -> SharedEncoder:
-    ckpt = load_stage_a(config["training"]["checkpoint_dir"])
+    ckpt = load_validated_stage_a(config, stage_a_metadata(config, data))
     model_cfg = config["model"]
     encoder = SharedEncoder(
         input_dim=data.train.features.shape[1],
@@ -67,29 +82,58 @@ def _build_frozen_encoder(config: dict, data: PreparedData, device: torch.device
 def run_stage_b(config: dict, data: PreparedData):
     device = torch.device(config["training"].get("device", "cpu"))
     torch.manual_seed(config.get("seed", 0))
-
-    encoder = _build_frozen_encoder(config, data, device)
-
     active_datasets = data.active_datasets
     model_cfg = config["model"]
     bank_kind = bank_kind_for_architecture(config["architecture"])
+
+    expert_names = expert_names_for_architecture(config["architecture"], active_datasets)
+    expert_bank = build_expert_bank(
+        bank_kind, expert_names, model_cfg["latent_dim"], len(data.class_names), model_cfg
+    ).to(device)
+    checkpoint_dir = config["training"]["checkpoint_dir"]
+    warmstart_mode = config["training"].get("stage_b", {}).get("warmstart_mode", "dataset")
+    if warmstart_mode == "random_init":
+        print(
+            "[Stage B] basic MoE: saving randomly initialized generic experts; "
+            "no dataset is assigned to or used to warm-start an expert"
+        )
+        save_stage_b(
+            checkpoint_dir,
+            expert_bank.state_dict(),
+            expert_names,
+            bank_kind,
+            training_summary={
+                "optimizer_steps": 0,
+                "examples_seen": 0,
+                "epochs_completed": 0,
+                "wall_seconds": 0.0,
+                "selected_epoch": 0,
+            },
+        )
+        clear_progress(checkpoint_dir, "B")
+        return expert_bank
+    if warmstart_mode != "dataset":
+        raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
+
+    encoder = _build_frozen_encoder(config, data, device)
 
     dataset = HarmonizedTensorDataset(data.train)
     all_class_idx = data.train.class_idx
     all_dataset_idx = data.train.dataset_idx
 
-    expert_bank = build_expert_bank(bank_kind, active_datasets, model_cfg["latent_dim"], len(data.class_names), model_cfg).to(device)
-
-    checkpoint_dir = config["training"]["checkpoint_dir"]
     checkpoint_every = config["training"].get("checkpoint_every_n_epochs", 1)
 
     resume_dataset_i, resume_epoch, resume_optimizer_state = 0, 0, None
+    optimizer_steps = examples_seen = 0
+    started = time.monotonic()
     progress = load_progress(checkpoint_dir, "B")
     if progress is not None:
         expert_bank.load_state_dict(progress["expert_bank_state"])
         resume_dataset_i = progress["dataset_i"]
         resume_epoch = progress["epoch"]
         resume_optimizer_state = progress["optimizer_state"]
+        optimizer_steps = int(progress.get("optimizer_steps", 0))
+        examples_seen = int(progress.get("examples_seen", 0))
         print(f"[Stage B] resuming from dataset[{resume_dataset_i}] epoch {resume_epoch} (found existing progress checkpoint)")
 
     for i, dataset_name in enumerate(active_datasets):
@@ -133,6 +177,8 @@ def run_stage_b(config: dict, data: PreparedData):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                optimizer_steps += 1
+                examples_seen += len(class_idx)
                 total_loss += loss.item()
                 n_batches += 1
             print(f"[Stage B] expert[{dataset_name}] epoch {epoch}: CE={total_loss / max(1, n_batches):.4f}")
@@ -143,8 +189,22 @@ def run_stage_b(config: dict, data: PreparedData):
                     "epoch": epoch + 1,
                     "expert_bank_state": expert_bank.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
+                    "optimizer_steps": optimizer_steps,
+                    "examples_seen": examples_seen,
                 })
 
-    save_stage_b(checkpoint_dir, expert_bank.state_dict(), list(active_datasets), bank_kind)
+    save_stage_b(
+        checkpoint_dir,
+        expert_bank.state_dict(),
+        expert_names,
+        bank_kind,
+        training_summary={
+            "optimizer_steps": optimizer_steps,
+            "examples_seen": examples_seen,
+            "epochs_completed": config["training"]["epochs_b"],
+            "wall_seconds": time.monotonic() - started,
+            "selected_epoch": config["training"]["epochs_b"],
+        },
+    )
     clear_progress(checkpoint_dir, "B")
     return expert_bank

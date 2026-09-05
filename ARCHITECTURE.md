@@ -131,16 +131,16 @@ the one place `architecture` maps onto a concrete bank class.
 `z → softmax over D dataset-experts`. Same config-selectable
 linear-or-shallow-MLP pattern as `moe_nids`'s `Gate`
 (`model.gate.hidden_dims`), just softmax'd over `D = len(active_datasets)`
-instead of over attack-class experts. Dense/soft output — **no top-k sparse
-routing**, ever; every dataset-expert gets a nonzero weight for every
-sample, same as `moe_nids`. Not trained until Stage C.
+instead of over attack-class experts. The gate always produces probabilities
+over all experts, but `model.gate.routing` chooses how they are consumed:
+`dense` blends all experts (default), while `top1` executes only the argmax
+expert for each row. The gate is not trained until Stage C.
 
-**Non-negotiable design constraint**: the gate is never PRIMARILY
-supervised by ground-truth dataset ID. If `CE(gate_logits, dataset_id)`
-were the dominant loss term, the whole system degenerates into a dataset
-classifier + hard router — a fundamentally simpler system than what this
-project studies. See §7 (Stage C) and §8 for exactly how (and how weakly)
-dataset identity is allowed to touch the gate at all.
+Gate training is config-selectable. The primary method is task-loss-driven;
+the explicit `moe_dataset_damex` comparison instead makes dataset-ID CE the
+semantic router target and prevents downstream task gradients from updating
+the gate. Neither method supplies dataset identity as an inference input, and
+inference routing is independently selectable as dense or top-1. See §7 and §8.
 
 ## 6. Combination rule — how expert + gate outputs become a prediction
 
@@ -163,12 +163,16 @@ here is already a proper categorical distribution (rows sum to 1), so
 named method purely for API symmetry with `moe_nids`'s
 `combined_scores_to_log_probs`.
 
-**At inference, gate weights are soft — no argmax routing, no forced hard
-dataset assignment.** Dataset-ambiguous or out-of-distribution traffic gets
-a blended prediction across every expert's opinion, weighted by the gate,
-rather than a coin-flip commitment to one expert's full output. This is the
-soft-mixing hypothesis `evaluation/ood_ambiguity_eval.py` tests directly
-against the `hard_two_stage` baseline (§10), which DOES commit hard.
+With `routing: dense`, dataset-ambiguous traffic receives the original blended
+prediction. With `routing: top1`, rows are grouped by gate argmax and only the
+selected expert runs. Offline evaluation may explicitly execute all experts
+to build diagnostic cross-dataset matrices, but those extra calls never
+participate in the deployed prediction.
+
+Under `top1 + assigned_only`, a predicted route is allowed to update an expert
+only when it matches the row's training-time dataset owner. A misroute updates
+no expert. This preserves strict dataset ownership while direct DAMEX CE trains
+the gate; at inference, dataset ID remains unavailable.
 
 `MoEDatasetNIDS.forward(x)` takes exactly one argument — `_assert_dataset_
 blind_signature` (`inference/predict.py`) checks this via
@@ -244,7 +248,7 @@ checkpoints. `training/checkpoint.py` additionally tags Stage B/C
 checkpoints with `bank_kind` (`"full"` or `"adapter"`), so a checkpoint
 always self-describes which expert-bank class to reconstruct it into.
 
-## 8. The gate-supervision auxiliary term — the non-negotiable design constraint, in detail
+## 8. Selectable gate-supervision methods
 
 `models/losses.py::dataset_aux_loss` + `training/stage_c_jointfinetune.py::_lambda_dataset_aux`
 
@@ -256,7 +260,14 @@ selected by `training.stage_c.gate_supervision`:
 |---|---|---|
 | `"none"` | `0.0` | Pure task-loss-driven gate. `dataset_aux_loss` is **never called** — not called-with-zero-weight, structurally skipped (`if lambda_dataset_aux > 0.0:` gate in `run_stage_c`). Verified by `tests/test_no_dataset_id_supervision.py` via a monkeypatched `dataset_aux_loss` that raises if invoked. |
 | `"light_aux"` (**default**) | `training.stage_c.lambda_dataset_aux`, default `0.1` | Low-weight regularizer — same role/magnitude as `moe_nids`'s Stage C `lambda_align=0.1`: a soft nudge for training stability, never the dominant signal. |
-| `"hard"` | `training.stage_c.lambda_dataset_aux_hard`, default `5.0` | **Ablation/baseline only, never the recommended default.** Makes the gate loss dominant enough that the gate approximates a real dataset classifier — selecting `architecture=moe_dataset_hard_gate` sets this automatically (`training/run.py::ARCHITECTURE_STAGE_C_DEFAULTS`). This run is expected to converge empirically close to the `hard_two_stage` baseline (§10); that convergence is itself a sanity check on the whole setup — if `moe_dataset_hard_gate` DIDN'T end up close to `hard_two_stage` under a dominant dataset-ID loss, something else in the pipeline would be suspect. |
+| `"hard"` | `training.stage_c.lambda_dataset_aux_hard`, default `5.0` | **Ablation/baseline only, never the recommended default.** Makes the gate loss dominant enough that the gate approximates a real dataset classifier — selecting `architecture=moe_dataset_hard_gate` applies this preset automatically. This run is expected to converge empirically close to the `hard_two_stage` baseline (§10); that convergence is itself a sanity check on the whole setup — if `moe_dataset_hard_gate` DIDN'T end up close to `hard_two_stage` under a dominant dataset-ID loss, something else in the pipeline would be suspect. |
+| `"damex"` | `training.stage_c.lambda_dataset_aux_damex`, default `1.0` | Direct DAMEX-style router supervision. The gate weights are detached in the downstream task mixture, so only dataset-ID CE and load balancing update the gate. Selecting `architecture=moe_dataset_damex` also defaults `expert_update_policy` to `assigned_only`, ensuring each expert receives parameter gradients only from its owned dataset. |
+
+The `hard` mode differs deliberately from `damex`: `hard` retains the task
+gradient into the gate and merely gives dataset CE a large coefficient.
+`damex` structurally removes that task gradient. Architecture presets are
+applied by `training.config.apply_architecture_defaults`; explicit `--set`
+values still win, making focused ablations possible without code edits.
 
 ## 9. Data pipeline
 
@@ -319,6 +330,12 @@ sharing the harmonization pipeline, data loading, and evaluation code.
 
 - **`PlainPooledSoftmax`** — ported from `moe_nids`: same shared encoder,
   single joint `C`-way softmax head, no dataset structure at all.
+- **`MatchedDenseClassifier`** — the capacity/compute control. It keeps the
+  shared encoder and replaces the expert bank plus gate with one pyramidal,
+  two-hidden-layer ReLU/dropout head. A deterministic integer solver matches
+  either all stored expert+gate parameters, top-1 active expert+gate
+  parameters, or top-1 Linear-layer MACs within 0.5%. The exact dimensions,
+  target, achieved value, and residual are checkpointed and reported.
 - **`NoFusionModel`** — ported from `moe_nids`: fully separate encoder+head
   per dataset, `forward(x, dataset_name)` requires ground-truth dataset ID
   at both train and inference.
@@ -337,6 +354,30 @@ sharing the harmonization pipeline, data loading, and evaluation code.
   `HardTwoStageModel.forward` is still dataset-blind in the same sense as
   `MoEDatasetNIDS.forward` and can be evaluated apples-to-apples on
   `evaluation/ood_ambiguity_eval.py`.
+
+### Fairness curriculum and accounting
+
+`training.baseline.encoder_init` explicitly selects cold initialization or
+the exact Stage-A encoder artifact. A Stage-A artifact is accepted only when
+its seed, encoder configuration, classes, active datasets, feature schema, and
+split signature match. `training.baseline.stage_b_warmstart=matched_exposure`
+freezes that encoder and feeds a dense head the same Stage-B batch schedule,
+examples, and optimizer-step count as the reference experts before the shared
+Stage-C schedule.
+
+Headline runs use `training.selection_mode=fixed_epochs`; `best_val` remains
+available for sensitivity analysis. `evaluation/resource_accounting.py`
+reports total/trainable/active parameters, component breakdowns, per-sample
+Linear MACs, `2 * MACs` FLOPs, stage steps/examples/epochs/wall time, and the
+Stage-A hash. For soft dense routing all experts are active; for top-1 routing
+the active path is encoder + gate + one expert; hard two-stage includes its
+router encoder and the selected classifier encoder sequentially. No-fusion is
+marked as an oracle because evaluation supplies the true dataset identity.
+
+`training/fairness_matrix.py` executes the complete paired seed set (0, 1, 2)
+with a shared immutable Stage-A checkpoint per seed. Aggregation rejects
+missing seeds or mixed split signatures and writes descriptive paired
+Student-t intervals to `Seed_Summary.csv`.
 
 `moe_dataset_hard_gate` is expected to converge empirically close to
 `hard_two_stage` (§8) — demonstrating that convergence is a documented
@@ -375,10 +416,32 @@ claim to verify by other means.
   (`Trials.csv`/`Overall_Metrics.csv`/`Per_Class_Metrics.csv`, plus
   `Per_Dataset_Metrics.csv`, new here) and both `comparison_table`
   (per-class) and `per_dataset_comparison_table` (per-dataset) helpers,
-  each pivoting all six architecture variants into one ablation table — see
+  each pivoting the configured architecture variants into one ablation table — see
   `notebooks/08_full_ablation_report.ipynb`.
 
 ## 12. Config-driven design
+
+### Basic MoE comparator
+
+`architecture=moe_basic` keeps the same shared encoder, gate, number of
+experts, per-expert MLP, class vocabulary, optimizer, routing implementation,
+and evaluation path as the full dataset-MoE. The expert count equals the
+number of active datasets solely to match parameter capacity; experts are
+named `expert_0`, `expert_1`, and so on and have no dataset ownership.
+
+Its preset changes only the dataset-specific parts of training:
+
+- `training.stage_b.warmstart_mode=random_init` replaces per-dataset expert
+  warm-start with a deterministic random expert-bank checkpoint.
+- `training.stage_c.gate_supervision=none` removes dataset-ID router loss.
+- `training.stage_c.expert_update_policy=all` lets pooled task gradients update
+  every softly weighted expert.
+- `training.stage_c.lambda_expert_anchor=0.0` removes the Stage-B specialization
+  anchor.
+
+The preset is additive. Switch between the original and comparator using
+`architecture=moe_dataset_soft` and `architecture=moe_basic`; explicit dotted
+overrides remain available for controlled ablations.
 
 Every structural knob — active datasets, active classes, the cross-dataset
 label taxonomy, architecture variant (including which expert-bank class and
@@ -394,7 +457,7 @@ identical mechanism to `moe_nids`.
 | Expert granularity | One expert per canonical **attack class** | One expert per **dataset** |
 | Expert output space | 3-way (target/benign/other), via deterministic relabeling | Full task vocabulary (`Benign` + every active class) directly, no relabeling |
 | Gate output dimension | `num_classes` (experts) | `num_datasets` (experts) |
-| Gate ground-truth supervision | N/A (no per-expert identity to supervise against) | Structurally forbidden as primary signal; optional low-weight aux term only (`gate_supervision`) |
+| Gate ground-truth supervision | N/A (no per-expert identity to supervise against) | Configurable: task-primary (`none` / `light_aux` / `hard`) or DAMEX-style direct dataset supervision (`damex`) |
 | Combination rule | Vote-pooling with discarded "OTHER" mass, per-row renormalization for CE | Straightforward soft mixture over full per-dataset distributions, already a proper distribution |
 | Cross-dataset representation sharing mechanism | Explicit latent-space alignment loss (centroid/momentum-centroid/contrastive) | None — whatever the shared encoder + soft gate/expert combination learns on its own in Stage C |
 | Target failure mode | Rare-class starvation / pooling | Negative transfer across datasets |

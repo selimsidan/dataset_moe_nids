@@ -56,9 +56,8 @@ class SharedHead(nn.Module):
 
 class AdapterExpertBank(nn.Module):
     """Drop-in replacement for DatasetExpertBank: one FiLMAdapter per
-    dataset, all feeding into ONE shared classification head. Every adapter
-    (and the shared head) still runs on every sample unconditionally --
-    same "every expert sees every sample" contract as the full-expert bank.
+    dataset, all feeding into ONE shared classification head. ``forward`` is
+    dense while ``forward_selected`` conditionally runs one adapter per row.
     """
 
     def __init__(
@@ -89,3 +88,21 @@ class AdapterExpertBank(nn.Module):
         stacked = torch.stack(outputs, dim=1)
         assert stacked.shape == (batch, self.num_experts, self.num_classes)
         return stacked
+
+    def forward_selected(self, z: torch.Tensor, selected_experts: torch.Tensor) -> torch.Tensor:
+        """Run one selected adapter and the shared head for each row."""
+        batch = z.shape[0]
+        if selected_experts.shape != (batch,):
+            raise ValueError("selected_experts must have shape (batch,)")
+        if batch == 0:
+            raise ValueError("top-1 dispatch requires a non-empty batch")
+        if int(selected_experts.min()) < 0 or int(selected_experts.max()) >= self.num_experts:
+            raise ValueError("selected_experts contains an index outside the expert bank")
+        output = z.new_zeros((batch, self.num_classes))
+        for expert_id, adapter in enumerate(self.adapters):
+            rows = torch.nonzero(selected_experts == expert_id, as_tuple=False).flatten()
+            if rows.numel() == 0:
+                continue
+            logits = self.shared_head(adapter(z.index_select(0, rows)))
+            output = output.index_copy(0, rows, logits)
+        return output

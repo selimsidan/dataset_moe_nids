@@ -199,8 +199,10 @@ data:
   stage_out_of_core_to_local: true
   low_sample_threshold: 200
 
-# moe_dataset_soft (primary) | moe_dataset_hard_gate (ablation) |
-# moe_dataset_adapters (ablation) | plain_pooled | no_fusion | hard_two_stage
+# moe_dataset_soft (primary) | moe_basic (generic native MoE comparator) |
+# moe_dataset_damex (strict dataset routing) |
+# moe_dataset_hard_gate (legacy hard-aux ablation) |
+# moe_dataset_adapters (ablation) | matched_dense | plain_pooled | no_fusion | hard_two_stage
 architecture: moe_dataset_soft
 
 model:
@@ -217,14 +219,23 @@ model:
   adapter:
     rank: 16       # low-rank residual dimension applied to z before the shared head
     dropout: 0.1
+  dense_match:
+    axis: total_params  # total_params | active_params | forward_macs
+    reference_routing: dense  # dense for stored capacity; top1 for active/compute controls
+    tolerance: 0.005
+    max_width: 2048
   gate:
     hidden_dims: []
+    routing: dense  # dense | top1; top1 executes exactly one expert per row
 
 load_balance:
   lambda_balance: 0.1
 
 training:
   stages: [A, B, C]  # subset of [A, B, C] to run this invocation
+  # Optional immutable Stage-A .pt file or directory shared by every method
+  # within one paired seed. null uses this run's checkpoint directory.
+  stage_a_checkpoint: null
   batch_size: 256
   min_per_class_per_batch: 4
   epochs_a: 20
@@ -233,20 +244,33 @@ training:
   lr: 0.001
   weight_decay: 0.0
   freeze_encoder_stage_b: true
+  selection_mode: fixed_epochs  # fixed_epochs (headline fairness) | best_val
+  baseline:
+    encoder_init: stage_a  # stage_a | random
+    stage_b_warmstart: none  # none | matched_exposure
+    # Optional immutable checkpoint file or directory shared across methods.
+    # null uses this run's training.checkpoint_dir/stage_a_encoder.pt.
+    stage_a_checkpoint: null  # deprecated compatibility alias; prefer training.stage_a_checkpoint
+  stage_b:
+    # dataset = original one-dataset-per-expert warm-start.
+    # random_init = save a capacity-matched generic bank without dataset-specific training;
+    # this is the native basic-MoE default selected by architecture=moe_basic.
+    warmstart_mode: dataset  # dataset | random_init
   stage_c_unfreeze: last_layer  # 'last_layer' | 'all' | 'none'
-  # Gate is optimized primarily so the combined task prediction is correct.
-  # "hard" is an explicit ablation/baseline only -- never the recommended
-  # default -- that makes the dataset-ID-aux loss dominant enough to turn
-  # the gate into a de facto dataset classifier, for comparison against
-  # hard_two_stage.
+  # Gate training is selectable. The default stays task-primary; "hard" keeps
+  # the task gradient but increases dataset supervision, while "damex" makes
+  # dataset CE + load balancing the gate's only training signals.
   stage_c:
-    gate_supervision: light_aux  # none | light_aux | hard
+    gate_supervision: light_aux  # none | light_aux | hard | damex
     lambda_dataset_aux: 0.1      # used when gate_supervision == light_aux
     lambda_dataset_aux_hard: 5.0 # used when gate_supervision == hard
+    # DAMEX mode removes the downstream task-loss gradient from the gate;
+    # dataset CE and load balancing are its only two training signals.
+    lambda_dataset_aux_damex: 1.0
     # all = conventional joint MoE updates. assigned_only = every row still
     # uses the full soft mixture, but only its dataset-owned expert receives
     # an expert-parameter gradient. Dataset-blind inference is unchanged.
-    expert_update_policy: all    # all | assigned_only
+    expert_update_policy: all    # all | assigned_only; DAMEX preset -> assigned_only
     # Mean squared distance from the Stage-B expert parameters. Zero disables
     # anchoring; notebook 09 enables a small value for specialization retention.
     lambda_expert_anchor: 0.0
@@ -267,6 +291,9 @@ evaluation:
   bootstrap_n: 1000
   bootstrap_seed: 0
   prediction_chunk_rows: 262144
+  # Full-data ROC-AUC uses bounded-memory score histograms. Higher values
+  # reduce quantization error at a small (classes x experts x bins) RAM cost.
+  roc_auc_bins: 4096
   output_dir: ${OUTPUT_DIR}/results/${run_name}
   # Held-out dataset excluded from active_datasets entirely, used only by
   # evaluation/ood_ambiguity_eval.py to test soft-mixing vs hard_two_stage

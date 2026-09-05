@@ -21,6 +21,7 @@ def load_config(path: str, overrides: list[str] | None = None) -> dict:
     for override in overrides or []:
         key, value = override.split("=", 1)
         _set_dotted(cfg, key, _coerce(value))
+    apply_architecture_defaults(cfg, overrides)
     cfg.setdefault("OUTPUT_DIR", _paths.OUTPUT_DIR)
     _resolve_placeholders(cfg, cfg)
     return cfg
@@ -81,3 +82,31 @@ def _resolve_string(value: str, root: dict) -> str:
 
 def deep_copy(cfg: dict) -> dict:
     return copy.deepcopy(cfg)
+
+
+_ARCHITECTURE_DEFAULTS = {
+    "moe_dataset_hard_gate": {"training.stage_c.gate_supervision": "hard"},
+    "moe_dataset_damex": {
+        "training.stage_c.gate_supervision": "damex",
+        "training.stage_c.expert_update_policy": "assigned_only",
+    },
+    "moe_basic": {
+        "training.stage_b.warmstart_mode": "random_init",
+        "training.stage_c.gate_supervision": "none",
+        "training.stage_c.expert_update_policy": "all",
+        "training.stage_c.lambda_expert_anchor": 0.0,
+    },
+}
+
+
+def apply_architecture_defaults(config: dict, overrides: list[str] | None = None) -> None:
+    """Apply opt-in architecture presets without defeating explicit CLI choices."""
+    architecture_defaults = _ARCHITECTURE_DEFAULTS.get(config.get("architecture"), {})
+    overridden_keys = {value.split("=", 1)[0] for value in overrides or []}
+    for dotted_key, value in architecture_defaults.items():
+        if dotted_key not in overridden_keys:
+            parts = dotted_key.split(".")
+            node = config
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value

@@ -11,13 +11,14 @@ stage; only the encoder is persisted.
 """
 from __future__ import annotations
 
+import time
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models.encoder import ProbeHead, SharedEncoder
 
-from .checkpoint import clear_progress, load_progress, save_progress, save_stage_a
+from .checkpoint import clear_progress, load_progress, save_progress, save_stage_a, stage_a_metadata
 from .dataset import HarmonizedTensorDataset, PreparedData
 
 
@@ -52,12 +53,17 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
     checkpoint_every = config["training"].get("checkpoint_every_n_epochs", 1)
 
     start_epoch = 0
+    optimizer_steps = 0
+    examples_seen = 0
+    started = time.monotonic()
     progress = load_progress(checkpoint_dir, "A")
     if progress is not None:
         encoder.load_state_dict(progress["encoder_state"])
         probe.load_state_dict(progress["probe_state"])
         optimizer.load_state_dict(progress["optimizer_state"])
         start_epoch = progress["epoch"]
+        optimizer_steps = int(progress.get("optimizer_steps", 0))
+        examples_seen = int(progress.get("examples_seen", 0))
         print(f"[Stage A] resuming from epoch {start_epoch} (found existing progress checkpoint)")
 
     for epoch in range(start_epoch, config["training"]["epochs_a"]):
@@ -72,6 +78,9 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
             ce.backward()
             optimizer.step()
 
+            optimizer_steps += 1
+            examples_seen += len(class_idx)
+
             total_ce += ce.item()
             n_batches += 1
         print(f"[Stage A] epoch {epoch}: CE={total_ce / n_batches:.4f}")
@@ -82,8 +91,23 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
                 "encoder_state": encoder.state_dict(),
                 "probe_state": probe.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "optimizer_steps": optimizer_steps,
+                "examples_seen": examples_seen,
             })
 
-    save_stage_a(checkpoint_dir, encoder.state_dict(), data.class_names)
+    metadata = stage_a_metadata(config, data)
+    metadata["training_summary"] = {
+        "optimizer_steps": optimizer_steps,
+        "examples_seen": examples_seen,
+        "epochs_completed": config["training"]["epochs_a"],
+        "wall_seconds": time.monotonic() - started,
+        "selected_epoch": config["training"]["epochs_a"],
+    }
+    save_stage_a(
+        checkpoint_dir,
+        encoder.state_dict(),
+        data.class_names,
+        metadata=metadata,
+    )
     clear_progress(checkpoint_dir, "A")
     return encoder

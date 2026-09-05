@@ -54,6 +54,60 @@ class PlainPooledSoftmax(nn.Module):
         return self.forward(x)["logits"].argmax(dim=1)
 
 
+class MatchedDenseHead(nn.Module):
+    """Two-hidden-layer dense comparator resolved against an MoE budget.
+
+    ``match_info`` is intentionally stored on the module (but not in the
+    state_dict) so runners and reports can record the exact integer solution
+    and residual instead of describing an approximate match as exact.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        num_classes: int,
+        hidden_dims: tuple[int, int],
+        dropout: float,
+        match_info: dict,
+    ) -> None:
+        super().__init__()
+        first, second = hidden_dims
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, first),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(first, second),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(second, num_classes),
+        )
+        self.hidden_dims = (first, second)
+        self.match_info = dict(match_info)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class MatchedDenseClassifier(nn.Module):
+    """Shared encoder plus a deterministic capacity/compute-matched head."""
+
+    def __init__(self, encoder: SharedEncoder, head: MatchedDenseHead) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.head = head
+
+    @property
+    def match_info(self) -> dict:
+        return self.head.match_info
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        z = self.encoder(x)
+        return {"z": z, "logits": self.head(z)}
+
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)["logits"].argmax(dim=1)
+
+
 class NoFusionModel(nn.Module):
     """Fully separate encoder+head per dataset -- no cross-dataset code path
     at all. `forward` requires the caller to name which dataset's sub-model
@@ -68,12 +122,19 @@ class NoFusionModel(nn.Module):
         latent_dim: int,
         num_classes: int,
         hidden_dims: list[int] = (256, 128),
+        activation: str = "relu",
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        if not dataset_names:
+            raise ValueError("NoFusionModel requires at least one dataset")
         self.dataset_names = list(dataset_names)
         self.num_classes = num_classes
         self.encoders = nn.ModuleDict(
-            {name: SharedEncoder(input_dim, hidden_dims, latent_dim) for name in dataset_names}
+            {
+                name: SharedEncoder(input_dim, hidden_dims, latent_dim, activation, dropout)
+                for name in dataset_names
+            }
         )
         self.heads = nn.ModuleDict(
             {name: ClassificationHead(latent_dim, num_classes) for name in dataset_names}
@@ -113,27 +174,48 @@ class HardTwoStageModel(nn.Module):
         num_classes: int,
         id_hidden_dims: list[int] = (256, 128),
         stage_b_hidden_dims: list[int] = (256, 128),
+        activation: str = "relu",
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        if not dataset_names:
+            raise ValueError("HardTwoStageModel requires at least one dataset")
         self.dataset_names = list(dataset_names)
         self.num_classes = num_classes
 
-        self.id_encoder = SharedEncoder(input_dim, id_hidden_dims, latent_dim)
+        self.id_encoder = SharedEncoder(input_dim, id_hidden_dims, latent_dim, activation, dropout)
         self.id_head = DatasetIDClassifierHead(latent_dim, len(dataset_names))
 
-        self.stage_b = NoFusionModel(dataset_names, input_dim, latent_dim, num_classes, stage_b_hidden_dims)
+        self.stage_b = NoFusionModel(
+            dataset_names,
+            input_dim,
+            latent_dim,
+            num_classes,
+            stage_b_hidden_dims,
+            activation,
+            dropout,
+        )
+
+    def dataset_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Stage-(a) logits, exposed for routing diagnostics only."""
+        return self.id_head(self.id_encoder(x))
 
     def predict_dataset_id(self, x: torch.Tensor) -> torch.Tensor:
-        return self.id_head(self.id_encoder(x)).argmax(dim=1)
+        return self.dataset_logits(x).argmax(dim=1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        dataset_pred = self.predict_dataset_id(x)  # (B,) index into self.dataset_names
+        dataset_logits = self.dataset_logits(x)
+        dataset_pred = dataset_logits.argmax(dim=1)  # (B,) index into self.dataset_names
         logits = x.new_zeros(x.shape[0], self.num_classes)
         for idx, name in enumerate(self.dataset_names):
             mask = dataset_pred == idx
             if mask.any():
                 logits[mask] = self.stage_b(x[mask], name)["logits"]
-        return {"logits": logits, "dataset_pred": dataset_pred}
+        return {
+            "logits": logits,
+            "dataset_logits": dataset_logits,
+            "dataset_pred": dataset_pred,
+        }
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward(x)["logits"].argmax(dim=1)

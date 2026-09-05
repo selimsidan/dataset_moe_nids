@@ -14,12 +14,26 @@ from .checkpoint import (
     STAGE_A_FILE,
     STAGE_B_FILE,
     STAGE_C_FILE,
+    BASELINE_MODEL_FILE,
+    BASELINE_STAGE_B_FILE,
+    HARD_ROUTER_FILE,
+    HARD_CLASSIFIERS_FILE,
     clear_progress,
     load_stage_c,
+    load_stage_b,
+    resolve_stage_a_path,
     stage_complete,
+    hard_stage_complete,
 )
 from .config import load_config
 from .out_of_core_data import prepare_out_of_core_data
+from .hard_two_stage_ooc import (
+    load_hard_two_stage_ooc,
+    run_hard_phase_a_ooc,
+    run_hard_phase_b_ooc,
+)
+from .dense_ooc import load_dense_ooc, run_dense_stage_b_ooc, run_dense_stage_c_ooc
+from .no_fusion_ooc import load_no_fusion_ooc, run_no_fusion_ooc
 from .out_of_core_train import (
     CONTRACT_FILE,
     STAGE_C_SUMMARY_FILE,
@@ -32,9 +46,13 @@ from .out_of_core_train import (
 
 
 def _restart(checkpoint_dir: str) -> None:
-    for stage in ("A", "B", "C"):
+    for stage in ("A", "B", "C", "DB", "DC", "NF", "HR", "HC"):
         clear_progress(checkpoint_dir, stage)
-    for filename in (STAGE_A_FILE, STAGE_B_FILE, STAGE_C_FILE, HARMONIZER_FILE, CONTRACT_FILE, STAGE_C_SUMMARY_FILE):
+    for filename in (
+        STAGE_A_FILE, STAGE_B_FILE, STAGE_C_FILE, BASELINE_MODEL_FILE, BASELINE_STAGE_B_FILE,
+        HARD_ROUTER_FILE, HARD_CLASSIFIERS_FILE,
+        HARMONIZER_FILE, CONTRACT_FILE, STAGE_C_SUMMARY_FILE,
+    ):
         path = os.path.join(checkpoint_dir, filename)
         if os.path.isfile(path):
             os.remove(path)
@@ -46,10 +64,11 @@ def main() -> None:
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
-    if config["architecture"] not in {"moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_adapters"}:
-        raise ValueError("out_of_core_full supports the three MoE architectures, not baseline architectures")
-    if config["architecture"] == "moe_dataset_hard_gate":
-        config["training"]["stage_c"]["gate_supervision"] = "hard"
+    if config["architecture"] not in {
+        "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
+        "moe_dataset_adapters", "moe_basic", "hard_two_stage", "plain_pooled", "matched_dense", "no_fusion",
+    }:
+        raise ValueError("out_of_core_full supports MoE, dense, and hard_two_stage architectures")
     if config["training"].get("device") == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable. Select a GPU Colab runtime.")
     checkpoint_dir = config["training"]["checkpoint_dir"]
@@ -68,6 +87,64 @@ def main() -> None:
     )
 
     stages = config["training"].get("stages", ["A", "B", "C"])
+    if config["architecture"] == "no_fusion":
+        baseline_cfg = config["training"].get("baseline", {})
+        if baseline_cfg.get("encoder_init", "stage_a") == "stage_a":
+            source = config["training"].get("stage_a_checkpoint") or baseline_cfg.get("stage_a_checkpoint")
+            if not source and not stage_complete(checkpoint_dir, "A"):
+                if "A" not in stages:
+                    raise RuntimeError("No-fusion Stage-A initialization requested but no checkpoint exists")
+                run_stage_a_ooc(config, context)
+        model = (
+            load_no_fusion_ooc(config, context)
+            if os.path.isfile(os.path.join(checkpoint_dir, BASELINE_MODEL_FILE))
+            else run_no_fusion_ooc(config, context)
+        )
+        reports = evaluate_and_report_ooc(model, context, config, contract)
+        print("\n=== Overall and per-origin metrics ===")
+        print(reports["overall"].to_string(index=False))
+        return
+
+    if config["architecture"] in {"plain_pooled", "matched_dense"}:
+        baseline_cfg = config["training"].get("baseline", {})
+        if baseline_cfg.get("encoder_init", "stage_a") == "stage_a":
+            source = config["training"].get("stage_a_checkpoint") or baseline_cfg.get("stage_a_checkpoint")
+            if not source and not stage_complete(checkpoint_dir, "A"):
+                if "A" not in stages:
+                    raise RuntimeError("Dense Stage-A initialization requested but no checkpoint exists")
+                run_stage_a_ooc(config, context)
+        if not os.path.isfile(os.path.join(checkpoint_dir, BASELINE_MODEL_FILE)):
+            model = run_dense_stage_b_ooc(config, context)
+            model = run_dense_stage_c_ooc(config, context, model)
+        else:
+            model = load_dense_ooc(config, context)
+        reports = evaluate_and_report_ooc(model, context, config, contract)
+        print("\n=== Overall and per-origin metrics ===")
+        print(reports["overall"].to_string(index=False))
+        print(f"[ooc-run] detailed reports={config['evaluation']['output_dir']}")
+        return
+
+    if config["architecture"] == "hard_two_stage":
+        baseline_cfg = config["training"].get("baseline", {})
+        if baseline_cfg.get("encoder_init", "stage_a") == "stage_a":
+            source = config["training"].get("stage_a_checkpoint") or baseline_cfg.get("stage_a_checkpoint")
+            if not source and not stage_complete(checkpoint_dir, "A"):
+                if "A" not in stages:
+                    raise RuntimeError("Hard two-stage Stage-A initialization requested but no checkpoint exists")
+                run_stage_a_ooc(config, context)
+        if "B" in stages and not hard_stage_complete(checkpoint_dir, "router"):
+            run_hard_phase_a_ooc(config, context)
+        if "B" in stages and not hard_stage_complete(checkpoint_dir, "classifiers"):
+            run_hard_phase_b_ooc(config, context)
+        if not all(hard_stage_complete(checkpoint_dir, stage) for stage in ("router", "classifiers")):
+            raise RuntimeError("Hard two-stage evaluation requires completed router and classifier phases")
+        model = load_hard_two_stage_ooc(config, context)
+        reports = evaluate_and_report_ooc(model, context, config, contract)
+        print("\n=== Overall and per-origin metrics ===")
+        print(reports["overall"].to_string(index=False))
+        print(f"[ooc-run] detailed reports={config['evaluation']['output_dir']}")
+        return
+
     for stage, function in (("A", run_stage_a_ooc), ("B", run_stage_b_ooc), ("C", run_stage_c_ooc)):
         if stage not in stages:
             continue
@@ -76,10 +153,21 @@ def main() -> None:
             continue
         function(config, context)
 
-    if not all(stage_complete(checkpoint_dir, stage) for stage in ("A", "B", "C")):
-        raise RuntimeError("Evaluation requires completed Stage A, B, and C checkpoints")
+    if not os.path.isfile(resolve_stage_a_path(config)) or not all(
+        stage_complete(checkpoint_dir, stage) for stage in ("B", "C")
+    ):
+        print("[ooc-run] Requested stages completed; full evaluation awaits Stage A+B+C checkpoints")
+        return
     model = build_ooc_model(config, context, torch.device(config["training"]["device"]))
-    model.load_state_dict(load_stage_c(checkpoint_dir)["model_state"])
+    stage_c_checkpoint = load_stage_c(checkpoint_dir)
+    model.load_state_dict(stage_c_checkpoint["model_state"])
+    model.training_summary = {}
+    stage_b_summary = load_stage_b(checkpoint_dir).get("training_summary")
+    stage_c_summary = stage_c_checkpoint.get("training_summary")
+    if stage_b_summary:
+        model.training_summary["B"] = stage_b_summary
+    if stage_c_summary:
+        model.training_summary["C"] = stage_c_summary
     reports = evaluate_and_report_ooc(model, context, config, contract)
     print("\n=== Overall and per-origin metrics ===")
     print(reports["overall"].to_string(index=False))

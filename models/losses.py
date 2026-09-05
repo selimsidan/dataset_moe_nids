@@ -1,18 +1,4 @@
-"""Gate load-balancing penalty (ported unchanged from moe_nids/models/losses.py)
-plus the low-weight, OPTIONAL dataset-ID auxiliary regularizer for the gate.
-
-IMPORTANT -- non-negotiable design constraint: `dataset_aux_loss` must never
-be the PRIMARY training signal for the gate. It exists only as a low-weight
-regularizer (`training.stage_c.lambda_dataset_aux`, default 0.05-0.1,
-analogous in role/magnitude to moe_nids' `lambda_align=0.1` in Stage C), or,
-for the explicit `hard` ablation, at a deliberately large weight so the
-gate approximates a real dataset classifier for comparison against
-`hard_two_stage` -- never as the recommended default. See
-training/stage_c_jointfinetune.py for how `gate_supervision` selects the
-weight, and tests/test_no_dataset_id_supervision.py for the structural
-check that `lambda_dataset_aux=0.0` truly removes dataset_id from the
-gate's loss computation graph.
-"""
+"""Gate load balancing and optional dataset-identity supervision losses."""
 from __future__ import annotations
 
 import torch
@@ -33,9 +19,10 @@ def load_balance_penalty(gate_weights: torch.Tensor) -> torch.Tensor:
 
 
 def dataset_aux_loss(gate_weights: torch.Tensor, dataset_id: torch.Tensor) -> torch.Tensor:
-    """CE(gate_weights, dataset_id) -- the ONLY place ground-truth dataset
-    identity is allowed to influence the gate, and only ever behind a
-    caller-supplied low weight (see module docstring). `gate_weights` are
+    """CE(gate_weights, dataset_id), the direct DAMEX routing target.
+
+    In task-primary modes this is absent or auxiliary. In ``damex`` mode it
+    is the gate's semantic training objective. `gate_weights` are
     already softmax'd (Gate.forward applies softmax), so this uses NLLLoss
     on their log rather than F.cross_entropy (which expects raw logits).
     """

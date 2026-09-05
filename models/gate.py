@@ -2,11 +2,9 @@
 shallow MLP, config-selectable -- same pattern as moe_nids' Gate, just
 softmax'd over `num_datasets` instead of `num_classes` experts.
 
-Non-negotiable design constraint (see models/moe.py / training/losses.py):
-this module never sees or is supervised directly by ground-truth dataset
-ID as its PRIMARY training signal. It is optimized primarily so the
-downstream combined task prediction is correct; any dataset-ID-aware loss
-term is applied outside this module, at low weight, in training/losses.py.
+The module itself remains dataset-blind: dataset ID is never an input. Stage C
+selects its training signal. Existing modes are task-loss-primary; the opt-in
+``damex`` mode instead trains this gate from dataset-ID CE plus load balancing.
 """
 from __future__ import annotations
 

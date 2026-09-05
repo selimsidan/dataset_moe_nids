@@ -12,32 +12,30 @@ genuinely transfers across datasets.
 
 ## Hard constraints (enforced structurally, not by convention)
 
-- **The gate is never PRIMARILY supervised on ground-truth dataset ID.**
-  `training/losses.py::dataset_aux_loss` is the only place dataset identity
-  can influence the gate, and only as a low-weight (`training.stage_c.
-  lambda_dataset_aux`, default 0.05-0.1) optional regularizer --
-  `training.stage_c.gate_supervision: hard` exists ONLY as an explicit
-  ablation/baseline, never the recommended default. See
+- **Gate supervision is an explicit experimental choice.** The primary
+  `moe_dataset_soft` method remains task-loss-driven, with dataset identity
+  absent or used only as a light auxiliary regularizer. The opt-in
+  `moe_dataset_damex` method reverses that contract: dataset-ID CE and load
+  balancing are the only router gradients, and dataset ownership is enforced
+  for expert-parameter updates. The older task-plus-dominant-auxiliary
+  `moe_dataset_hard_gate` ablation remains available. See
   `tests/test_no_dataset_id_supervision.py`, which verifies this
   structurally (the loop never even calls `dataset_aux_loss` when
   `gate_supervision: none`), not just that its weight happens to be zero.
-- **Soft gating at inference -- no hard routing, no argmax dataset
-  assignment.** `Gate` outputs a dense softmax over dataset-experts;
-  `MoEDatasetNIDS`'s combination rule blends every expert's full
-  class-probability distribution by that soft weight. Dataset-ambiguous or
-  out-of-distribution traffic gets a blended prediction, not a coin-flip
-  commitment to one expert -- this is the hypothesis
-  `evaluation/ood_ambiguity_eval.py` tests directly against `hard_two_stage`.
+- **Routing is an explicit experimental choice.** `model.gate.routing: dense`
+  remains the default and blends every expert. The opt-in `top1` path performs
+  real grouped dispatch: only the argmax expert executes for each row. The gate
+  still receives only features, never ground-truth dataset identity, at
+  inference.
 - **No dataset identity at inference.** `MoEDatasetNIDS.forward(x)` takes
   exactly one argument; `inference/predict.py` asserts this via
   `inspect.signature` before serving predictions. See
   `tests/test_dataset_blind_inference.py`.
-- **Every expert sees every sample.** `DatasetExpertBank.forward` (and
-  `AdapterExpertBank.forward`) runs every expert on the full batch
-  unconditionally, in Stage C and at inference alike -- no routing/filtering
-  step to accidentally introduce. (Stage B is the one deliberate exception:
-  it trains one dataset-expert at a time, on purpose, on only that
-  dataset's own rows -- see `training/stage_b_warmstart.py`.)
+- **Sparse dispatch is structural when selected.** The dense bank path still
+  runs every expert. `forward_selected` groups rows by argmax expert and never
+  invokes an unselected expert. With DAMEX plus `assigned_only`, misrouted rows
+  update no expert, so predicted routing cannot contaminate another dataset's
+  expert.
 - **Config-driven dataset selection, zero hardcoded dataset counts.** Every
   module (registry, harmonizer, expert-bank sizing, training, evaluation)
   derives its dataset list from `data.active_datasets` alone. See
@@ -63,8 +61,8 @@ models/
   adapters.py                AdapterExpertBank -- FiLM-style lightweight ablation alternative
   gate.py                    Gate (softmax over dataset-experts)
   moe.py                     MoEDatasetNIDS -- soft mixture-of-experts combination rule
-  losses.py                  load_balance_penalty (ported) + dataset_aux_loss (low-weight-only)
-  baselines.py                PlainPooledSoftmax, NoFusionModel, HardTwoStageModel
+  losses.py                  load_balance_penalty + direct/auxiliary dataset-ID CE
+  baselines.py                plain, matched-dense, no-fusion, and hard-two-stage models
 training/
   config.py                   YAML loader + --set dotted overrides (ported)
   dataset.py                  prepare_datasets(): raw -> split -> harmonized tensors + dataset_idx
@@ -74,7 +72,11 @@ training/
   stage_a_pretrain.py          Stage A
   stage_b_warmstart.py         Stage B (independent per-dataset expert warm-start)
   stage_c_jointfinetune.py     Stage C (gate + joint fine-tune)
-  baseline_train.py            trains plain_pooled / no_fusion / hard_two_stage
+  baseline_train.py            fairness-controlled in-memory baseline trainers
+  dense_ooc.py                 resumable plain/matched-dense full-data training
+  no_fusion_ooc.py             resumable oracle no-fusion full-data training
+  hard_two_stage_ooc.py        resumable disk-backed phases A/B for the full-data baseline
+  fairness_matrix.py           paired seeds 0/1/2 experiment launcher + aggregation
   run.py                       CLI entry point (architecture + stage selection via config)
 inference/predict.py         single shared-encoder inference path, dataset-blind by construction
 evaluation/
@@ -83,6 +85,8 @@ evaluation/
   ood_ambiguity_eval.py        hard_two_stage vs soft-gated MoE on dataset-ambiguous/OOD traffic
   gate_analysis.py             gate weight distribution, expert utilization, collapse check
   report.py                    comparison tables + Trial_ID-keyed tracker CSVs incl. Per_Dataset_Metrics.csv
+  resource_accounting.py       total/active parameters, MACs/FLOPs, and training budgets
+  seed_summary.py              paired three-seed mean/SD/difference summaries
 notebooks/                   Colab-runnable workflows, one config cell each
 tests/                       dataset-blind / no-dataset-id-supervision / active-dataset-toggle tests
 ```
@@ -98,6 +102,27 @@ It securely clones this private repository with a token read from
 Colab Secrets, mounts the shared Drive datasets, runs the tests and full
 training pipeline, evaluates the test split, and displays the tracker CSVs
 persisted to Drive.
+
+[`notebooks/10_colab_end_to_end_damex.ipynb`](notebooks/10_colab_end_to_end_damex.ipynb)
+is the dedicated start-to-finish DAMEX workflow. It locks Stage C to direct
+dataset-ID gate supervision and `assigned_only` expert updates, verifies the
+resolved contract before training, and supports both a small in-memory smoke
+run and the full disk-backed NF-v3 run.
+
+[`notebooks/11_colab_end_to_end_damex_top1.ipynb`](notebooks/11_colab_end_to_end_damex_top1.ipynb)
+adds true top-1 sparse expert execution to the DAMEX contract. Dense routing
+remains the default and can be restored with `model.gate.routing=dense`.
+
+[`notebooks/12_colab_end_to_end_basic_moe.ipynb`](notebooks/12_colab_end_to_end_basic_moe.ipynb)
+is the capacity-matched native MoE comparison: generic experts, no
+dataset-specific warm-start or ownership, and no dataset-ID router loss.
+
+[`notebooks/13_colab_end_to_end_hard_two_stage.ipynb`](notebooks/13_colab_end_to_end_hard_two_stage.ipynb)
+is the matching standalone four-dataset hard two-stage run. It locks the
+same 47-feature preprocessing and encoder MLP dimensions, trains only the
+two independent phases, reports stage-A dataset-routing accuracy, and joins
+its per-origin macro-F1 results with the primary run when those results are
+available.
 
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
@@ -137,18 +162,20 @@ architecture, capacity, or training settings change. A signed run contract
 prevents incompatible checkpoints from being reused even if the name is
 accidentally left unchanged.
 
-For the primary four-way comparison, the shared encoder is `47 -> 128 -> 64`,
-matching the dense widths of the diagnostic pooled MLP. The MoE adds four
-linear `64 -> classes` expert heads and a `64 -> 4` soft gate, for about
-20,380 deployed parameters versus about 16,214 in the 22-class diagnostic
-MLP (roughly 1.26x, rather than the earlier nearly 8x mismatch). The primary
-gate is trained from task and load-balancing losses only; dataset-ID auxiliary
-supervision is disabled so it receives no training-time identity advantage.
+The configured full experts are MLPs (`64 -> 128 -> 64 -> classes`), so the
+plain linear pooled head is intentionally a minimal ablation rather than a
+capacity-matched baseline. `matched_dense` now constructs the corresponding
+total-parameter, top-1-active-parameter, and top-1-MAC controls dynamically for
+the actual dataset/class combination. The primary gate's supervision remains
+configurable and is recorded with every trial.
 
 Detailed full-data reports include combined and per-origin overall metrics,
-exact per-class confusion metrics, the full confusion matrix, mean gate
+per-class confusion metrics and one-vs-rest ROC-AUC, the full confusion matrix, mean gate
 weights by true dataset origin, expert utilization, and reusable chunked
-prediction files. Prepared splits are reusable across different MoE
+prediction files. In-memory runs report exact per-class plus macro, weighted,
+and micro ROC-AUC. Full-data runs preserve bounded memory with a configurable
+4096-bin streaming approximation (`evaluation.roc_auc_bins`) and label the
+method in each CSV. Prepared splits are reusable across different MoE
 architectures when their data contracts match.
 
 The heterogeneous CICFlowMeter/UNSW/CICIoT datasets remain available to the
@@ -165,13 +192,25 @@ pip install -r requirements.txt
 python -m training.run --config config/default.yaml --set architecture=moe_dataset_soft
 
 # Ablations, through the same entry point:
+python -m training.run --config config/default.yaml --set architecture=moe_basic
 python -m training.run --config config/default.yaml --set architecture=moe_dataset_hard_gate
+python -m training.run --config config/default.yaml --set architecture=moe_dataset_damex
 python -m training.run --config config/default.yaml --set architecture=moe_dataset_adapters
 
 # Baselines:
 python -m training.run --config config/default.yaml --set architecture=plain_pooled
+python -m training.run --config config/default.yaml --set architecture=matched_dense \
+    --set model.dense_match.axis=total_params
 python -m training.run --config config/default.yaml --set architecture=no_fusion
 python -m training.run --config config/default.yaml --set architecture=hard_two_stage
+
+# Print the complete three-seed fairness matrix; add --execute to run it:
+python -m training.fairness_matrix --config config/default.yaml \
+    --prefix fair_comparison_v1 --execution-mode out_of_core
+
+# Full four-dataset disk-backed hard two-stage run (phases A and B only):
+python -m training.ooc_run --config config/default.yaml \
+    --set architecture=hard_two_stage --set training.stages=[A,B]
 
 # Fast iteration on a 2-dataset subset -- zero code changes:
 python -m training.run --config config/default.yaml \
@@ -182,7 +221,12 @@ python -m training.run --config config/default.yaml --set training.stages=[C]
 ```
 
 Results land in `evaluation.output_dir` as `Trials.csv` / `Overall_Metrics.csv`
-/ `Per_Class_Metrics.csv` / `Per_Dataset_Metrics.csv`, keyed by `Trial_ID`.
+/ `Per_Class_Metrics.csv` / `Per_Dataset_Metrics.csv` /
+`Resource_Accounting.csv`, keyed by `Trial_ID`.
+Overall and per-dataset outputs include accuracy, balanced accuracy, complete
+macro/micro/weighted precision-recall-F1 groups, and macro/weighted/micro
+one-vs-rest ROC-AUC;
+the per-class output includes one-vs-rest ROC-AUC for every evaluable class.
 Use `evaluation.report.comparison_table` / `per_dataset_comparison_table` to
 pivot several `EvaluationResult`s (one per architecture variant) into a
 single ablation table -- see `notebooks/08_full_ablation_report.ipynb`.
@@ -192,11 +236,48 @@ single ablation table -- see `notebooks/08_full_ablation_report.ipynb`.
 | Value | What it is |
 |---|---|
 | `moe_dataset_soft` | **Primary.** One full expert per dataset, soft gate, `gate_supervision: light_aux`. |
+| `moe_basic` | Capacity-matched native MoE comparator. Generic unassigned experts learn jointly from pooled task gradients; the gate uses task loss plus load balancing only. No dataset-ID loss, ownership mask, or dataset-specific warm-start. |
 | `moe_dataset_hard_gate` | Ablation: same architecture, `gate_supervision: hard` -- shows what's lost by undoing the "don't supervise the gate on dataset ID" decision. Should converge close to `hard_two_stage`. |
+| `moe_dataset_damex` | DAMEX-style strict option: the gate learns only from direct dataset-ID CE plus load balancing (no downstream task gradient), and expert updates default to `assigned_only`. Inference remains dataset-blind; routing can be dense or top-1. |
 | `moe_dataset_adapters` | Ablation: `AdapterExpertBank` (shared head + per-dataset low-rank FiLM correction) instead of full independent expert heads -- less overfitting risk on small datasets. |
 | `plain_pooled` | Baseline: single shared encoder + one joint classification head, no dataset structure. |
-| `no_fusion` | Baseline: fully separate encoder+head per dataset, `forward(x, dataset_name)` requires ground-truth dataset ID (train AND inference). |
+| `matched_dense` | Two-hidden-layer dense control. `model.dense_match.axis` selects total parameters, top-1 active parameters, or top-1 forward MACs; resolved widths and residual are reported. |
+| `no_fusion` | Oracle reference: fully separate encoder+head per dataset, `forward(x, dataset_name)` requires ground-truth dataset ID at inference and is therefore excluded from the dataset-blind headline ranking. |
 | `hard_two_stage` | Baseline (new to this project): standalone dataset classifier (stage a) hard-routes each sample to an independent per-dataset classifier (stage b). The literal "obvious two-step approach" this project needs to beat -- `forward(x)` is still dataset-blind (routes on its OWN predicted dataset ID), so it's comparable apples-to-apples on the OOD/ambiguity eval. |
+
+Routing is independently controlled by `model.gate.routing`: `dense`
+(default, backwards-compatible) or `top1` (one executed expert per row).
+For the combined experiment use:
+
+```bash
+python -m training.run --config config/default.yaml \
+  --set architecture=moe_dataset_damex \
+  --set model.gate.routing=top1
+```
+
+## Fair comparison protocol
+
+The paper-facing protocol separates initialization, capacity, and deployed
+compute instead of treating them as one comparison. For every seed, one
+immutable Stage-A checkpoint is shared and validated against the encoder
+shape, class vocabulary, feature schema, split signature, active datasets,
+and seed. Baselines select `training.baseline.encoder_init=stage_a|random` and
+`training.baseline.stage_b_warmstart=none|matched_exposure`. Matched exposure
+uses the same Stage-B per-dataset batch sequence, example count, and optimizer
+step budget as expert warm-starting.
+
+`training.selection_mode=fixed_epochs` is the headline setting;
+`best_val` is a secondary sensitivity analysis. Parameter matching is
+downstream of the common encoder. The deterministic solver retains a
+pyramidal two-hidden-layer MLP, fails above 0.5% residual, and never pads the
+model with unused parameters. Active-parameter matching is not described as
+iso-FLOPs unless its separately reported forward-FLOP residual also qualifies.
+
+Run seeds 0, 1, and 2 through `training.fairness_matrix`. The resulting
+`Seed_Summary.csv` contains mean, sample standard deviation, and paired
+method-minus-reference Student-t intervals. With only three seeds, those
+intervals are descriptive and are not significance claims. Historical runs
+without the Stage-A metadata contract must not be merged into this table.
 
 ## Three-stage training curriculum
 
@@ -217,7 +298,9 @@ best early and starving the rest of gradient.
    `training.stage_c_unfreeze`, trained end-to-end with
    `CE(combined_probs, y) + lambda_balance * load_balance_penalty(gate_weights)
    + lambda_dataset_aux * CE(gate_weights, dataset_id)`. Batches drawn via
-   `ClassBalancedBatchSampler` over the TASK class label, not dataset ID.
+   `ClassBalancedBatchSampler` over the TASK class label, not dataset ID. In
+   `gate_supervision: damex`, the gate weights used by the task term are
+   detached, so only the latter two terms update the router.
 
 ## Data
 
