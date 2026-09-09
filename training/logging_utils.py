@@ -11,15 +11,29 @@ import sys
 
 class _Tee:
     def __init__(self, *streams) -> None:
-        self._streams = streams
+        self._streams = list(streams)
 
     def write(self, msg: str) -> None:
-        for s in self._streams:
-            s.write(msg)
+        for index, stream in enumerate(list(self._streams)):
+            try:
+                stream.write(msg)
+            except (OSError, ValueError) as exc:
+                if index == 0:
+                    raise
+                self._streams.remove(stream)
+                self._streams[0].write(
+                    f"\n[logging] persistent log became unavailable; continuing live only: {exc}\n"
+                )
+                self._streams[0].flush()
 
     def flush(self) -> None:
-        for s in self._streams:
-            s.flush()
+        for index, stream in enumerate(list(self._streams)):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                if index == 0:
+                    raise
+                self._streams.remove(stream)
 
 
 def tee_stdout_to_file(log_path: str) -> None:

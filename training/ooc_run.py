@@ -106,6 +106,14 @@ def main() -> None:
     print(f"[ooc-run] python={sys.executable} architecture={config['architecture']}", flush=True)
     print(f"[ooc-run] datasets={config['data']['active_datasets']}", flush=True)
     print(f"[ooc-run] checkpoint_dir={checkpoint_dir}", flush=True)
+    print(
+        f"[ooc-run] schedule stages={config['training'].get('stages')} "
+        f"epochs_a={config['training'].get('epochs_a')} "
+        f"epochs_b={config['training'].get('epochs_b')} "
+        f"epochs_c={config['training'].get('epochs_c')} "
+        f"batch_size={config['training'].get('batch_size')}",
+        flush=True,
+    )
     context = prepare_out_of_core_data(config)
     contract = ensure_run_contract(config, context)
     print(f"[ooc-run] contract={contract['signature']} split_signatures={context.split_signatures}")

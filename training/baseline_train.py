@@ -305,7 +305,7 @@ def train_hard_two_stage(config: dict, data: PreparedData) -> HardTwoStageModel:
         generator=torch.Generator().manual_seed(config.get("seed", 0)),
     )
     steps = examples = 0
-    epochs = int(config["training"]["epochs_c"])
+    epochs = int(config["training"]["epochs_a"])
     for epoch in range(epochs):
         for features, dataset_ids in loader:
             features, dataset_ids = features.to(device), dataset_ids.to(device)

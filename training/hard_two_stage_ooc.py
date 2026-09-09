@@ -86,10 +86,21 @@ def run_hard_phase_a_ooc(config: dict, context: OutOfCoreContext) -> HardTwoStag
         start_epoch = int(progress["epoch"])
         steps = int(progress.get("optimizer_steps", 0))
         examples = int(progress.get("examples_seen", 0))
+        print(
+            f"[hard-two-stage phase A] resuming after completed epoch {start_epoch}; "
+            "the interrupted partial epoch will be replayed",
+            flush=True,
+        )
     batch_size, block_rows, buffer_blocks = _settings(config)
     total_rows = len(context.data.train.dataset_idx)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
-    for epoch in range(start_epoch, int(config["training"]["epochs_c"])):
+    phase_a_epochs = int(config["training"]["epochs_a"])
+    print(
+        f"[hard-two-stage phase A] schedule={phase_a_epochs} epoch(s), "
+        f"starting_epoch={start_epoch + 1}",
+        flush=True,
+    )
+    for epoch in range(start_epoch, phase_a_epochs):
         rng = np.random.default_rng(config.get("seed", 0) + epoch)
         model.id_encoder.train(); model.id_head.train()
         loss_sum = 0.0; rows_seen = 0
@@ -112,6 +123,10 @@ def run_hard_phase_a_ooc(config: dict, context: OutOfCoreContext) -> HardTwoStag
             "optimizer_steps": steps,
             "examples_seen": examples,
         })
+        print(
+            f"[hard-two-stage phase A] resumable checkpoint saved after epoch {epoch + 1}",
+            flush=True,
+        )
     _atomic_torch_save({
         "id_encoder_state": model.id_encoder.state_dict(),
         "id_head_state": model.id_head.state_dict(),
@@ -119,9 +134,9 @@ def run_hard_phase_a_ooc(config: dict, context: OutOfCoreContext) -> HardTwoStag
         "training_summary": {
             "optimizer_steps": steps,
             "examples_seen": examples,
-            "epochs_completed": int(config["training"]["epochs_c"]),
+            "epochs_completed": phase_a_epochs,
             "wall_seconds": time.monotonic() - started,
-            "selected_epoch": int(config["training"]["epochs_c"]),
+            "selected_epoch": phase_a_epochs,
         },
     }, os.path.join(checkpoint_dir, HARD_ROUTER_FILE))
     clear_progress(checkpoint_dir, "HR")
@@ -146,6 +161,11 @@ def run_hard_phase_b_ooc(config: dict, context: OutOfCoreContext) -> HardTwoStag
         optimizer_state = progress.get("optimizer_state")
         steps = int(progress.get("optimizer_steps", 0))
         examples = int(progress.get("examples_seen", 0))
+        print(
+            f"[hard-two-stage phase B] resuming dataset_index={resume_dataset} "
+            f"after completed epoch={resume_epoch}",
+            flush=True,
+        )
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for dataset_i, name in enumerate(context.data.active_datasets):
@@ -187,6 +207,11 @@ def run_hard_phase_b_ooc(config: dict, context: OutOfCoreContext) -> HardTwoStag
                 "optimizer_steps": steps,
                 "examples_seen": examples,
             })
+            print(
+                f"[hard-two-stage phase B:{name}] resumable checkpoint saved "
+                f"after epoch {epoch + 1}",
+                flush=True,
+            )
         save_progress(checkpoint_dir, "HC", {
             "dataset_i": dataset_i + 1,
             "epoch": 0,

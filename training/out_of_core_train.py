@@ -181,6 +181,29 @@ def _progress_reporter(tag: str, total_rows: int, every_rows: int):
     started = time.monotonic()
     next_report = max(1, every_rows)
 
+    def memory_status() -> str:
+        values = {}
+        try:
+            with open("/proc/self/status") as handle:
+                for line in handle:
+                    key, _, value = line.partition(":")
+                    if key in {"VmRSS", "VmHWM"}:
+                        amount = float(value.split()[0]) / 1024
+                        values[key] = f"{amount:.0f}MiB"
+        except (OSError, ValueError, IndexError):
+            pass
+        parts = []
+        if "VmRSS" in values:
+            parts.append(f"rss={values['VmRSS']}")
+        if "VmHWM" in values:
+            parts.append(f"rss_peak={values['VmHWM']}")
+        if torch.cuda.is_available():
+            parts.extend([
+                f"cuda_alloc={torch.cuda.memory_allocated() / 2**20:.0f}MiB",
+                f"cuda_reserved={torch.cuda.memory_reserved() / 2**20:.0f}MiB",
+            ])
+        return " ".join(parts)
+
     def report(rows_seen: int, *, force: bool = False) -> None:
         nonlocal next_report
         if not force and rows_seen < next_report:
@@ -190,7 +213,7 @@ def _progress_reporter(tag: str, total_rows: int, every_rows: int):
         percent = 100.0 * rows_seen / total_rows if total_rows else 100.0
         print(
             f"[{tag}] progress={rows_seen:,}/{total_rows:,} ({percent:.1f}%) "
-            f"elapsed={elapsed / 60:.1f}m rate={rate:,.0f} rows/s",
+            f"elapsed={elapsed / 60:.1f}m rate={rate:,.0f} rows/s {memory_status()}",
             flush=True,
         )
         while next_report <= rows_seen:
