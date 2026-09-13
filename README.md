@@ -95,9 +95,11 @@ tests/                       dataset-blind / no-dataset-id-supervision / active-
 
 [`notebooks/00_colab_end_to_end.ipynb`](notebooks/00_colab_end_to_end.ipynb)
 is the canonical start-to-finish Colab workflow. It is currently finalized
-for the primary four-way `moe_dataset_soft` comparison against the diagnostic
-project's fixed pooled MLP; its configuration cell exposes execution mode,
-seed, run name, and resume behavior while documenting the locked model choices.
+for the four-way dense `moe_dataset_soft` active-budget comparison against
+hard two-stage routing. Its `64 -> 45 -> classes` experts match the hard
+model's active parameters and Linear MACs within 0.5% for the finalized
+22-class combination; its configuration cell exposes execution mode, seed,
+run name, and resume behavior while documenting the locked model choices.
 It securely clones this private repository with a token read from
 Colab Secrets, mounts the shared Drive datasets, runs the tests and full
 training pipeline, evaluates the test split, and displays the tracker CSVs
@@ -123,6 +125,13 @@ same 47-feature preprocessing and encoder MLP dimensions, trains only the
 two independent phases, reports stage-A dataset-routing accuracy, and joins
 its per-origin macro-F1 results with the primary run when those results are
 available.
+
+[`notebooks/15_router_bottleneck_diagnostics.ipynb`](notebooks/15_router_bottleneck_diagnostics.ipynb)
+loads notebook 00's completed capacity-matched MoE, trains or reuses a hard
+baseline initialized from the exact same Stage-A checkpoint, and produces the
+deployable, learned-top-1, oracle-route, confidence-bin, route-conditioned,
+per-dataset/per-class, expert-cross-dataset, and resource-accounting diagnostics
+in one top-to-bottom run.
 
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
@@ -162,12 +171,14 @@ architecture, capacity, or training settings change. A signed run contract
 prevents incompatible checkpoints from being reused even if the name is
 accidentally left unchanged.
 
-The configured full experts are MLPs (`64 -> 128 -> 64 -> classes`), so the
+The default configuration's full experts are MLPs (`64 -> 128 -> 64 -> classes`), so the
 plain linear pooled head is intentionally a minimal ablation rather than a
 capacity-matched baseline. `matched_dense` now constructs the corresponding
 total-parameter, top-1-active-parameter, and top-1-MAC controls dynamically for
 the actual dataset/class combination. The primary gate's supervision remains
-configurable and is recorded with every trial.
+configurable and is recorded with every trial. Notebook 00 deliberately
+overrides the expert width to `64 -> 45 -> classes` for its hard-active-budget
+control; it does not change the repository-wide default architecture.
 
 Detailed full-data reports include combined and per-origin overall metrics,
 per-class confusion metrics and one-vs-rest ROC-AUC, the full confusion matrix, mean gate
