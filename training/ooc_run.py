@@ -195,6 +195,9 @@ def main() -> None:
     ):
         print("[ooc-run] Requested stages completed; full evaluation awaits Stage A+B+C checkpoints")
         return
+    if not config["training"].get("run_final_evaluation", True):
+        print("[ooc-run] All checkpoints are ready; final evaluation deferred by configuration")
+        return
     model = build_ooc_model(config, context, torch.device(config["training"]["device"]))
     stage_c_checkpoint = load_stage_c(checkpoint_dir)
     model.load_state_dict(stage_c_checkpoint["model_state"])

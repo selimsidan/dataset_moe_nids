@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from types import SimpleNamespace
@@ -58,6 +59,36 @@ def test_bounded_shuffle_uses_every_row_once_and_mixes_blocks():
     rows = np.concatenate(batches)
     assert np.array_equal(np.sort(rows), np.arange(800))
     assert len(np.unique(batches[0] // 100)) > 1
+
+
+def test_stage_schedule_and_final_evaluation_are_not_part_of_run_contract(tmp_path):
+    split = PreparedSplit(
+        np.zeros((2, 2), dtype=np.float32),
+        np.asarray([0, 1], dtype=np.int16),
+        np.asarray([0, 0], dtype=np.int16),
+        None,
+    )
+    data = PreparedData(None, ["Benign", "Attack"], ["A"], split, split, split)
+    context = OutOfCoreContext(data, {}, {"A": "split"}, "prep", "unused", ["f0", "f1"])
+    config = {
+        "architecture": "moe_dataset_private_encoders",
+        "model": {"latent_dim": 2, "encoder": {}, "expert": {}, "gate": {}},
+        "load_balance": {"lambda_balance": 0.1},
+        "training": {
+            "checkpoint_dir": str(tmp_path), "device": "cpu", "stages": ["A"],
+            "run_final_evaluation": False, "epochs_a": 1,
+        },
+    }
+
+    stage_a_contract = ensure_run_contract(config, context)
+    stage_b_config = copy.deepcopy(config)
+    stage_b_config["training"]["stages"] = ["B"]
+    stage_b_config["training"]["run_final_evaluation"] = True
+    stage_b_contract = ensure_run_contract(stage_b_config, context)
+
+    assert stage_a_contract == stage_b_contract
+    assert "stages" not in stage_a_contract["training"]
+    assert "run_final_evaluation" not in stage_a_contract["training"]
 
 
 @pytest.mark.parametrize("architecture", ["moe_dataset_soft", "moe_dataset_private_encoders"])

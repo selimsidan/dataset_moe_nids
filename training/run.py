@@ -215,6 +215,9 @@ def main() -> None:
         if not stage_a_ready or not all(stage_complete(local_checkpoint_dir, stage) for stage in ("B", "C")):
             print("[run] Requested stages completed; full evaluation awaits Stage A+B+C checkpoints")
             return
+        if not config["training"].get("run_final_evaluation", True):
+            print("[run] All checkpoints are ready; final evaluation deferred by configuration")
+            return
         model = build_model_from_checkpoints(config, data, torch.device(config["training"].get("device", "cpu")))
         model.load_state_dict(load_stage_c(config["training"]["checkpoint_dir"])["model_state"])
         y_true, y_pred, ds_names, y_score = _predict_moe(config, data)

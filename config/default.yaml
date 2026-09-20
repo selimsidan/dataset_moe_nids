@@ -295,6 +295,10 @@ training:
   # Emit progress during very large disk-backed epochs. Logging only; it does
   # not affect sampling, optimization, checkpoints, or model results.
   progress_every_rows: 1000000
+  # Execution-only switch for staged notebook orchestration. This is excluded
+  # from the scientific run contract so latent reports can be saved before the
+  # expensive final downstream evaluation.
+  run_final_evaluation: true
   early_stopping_patience: 5
   force_restart: false
 

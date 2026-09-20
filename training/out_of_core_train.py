@@ -45,17 +45,36 @@ from .sampler import class_domain_balanced_row_batches
 
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
+ORCHESTRATION_TRAINING_KEYS = {
+    "checkpoint_dir",
+    "device",
+    "force_restart",
+    "progress_every_rows",
+    "run_final_evaluation",
+    "stages",
+}
 
 
 def _hash(value: dict) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
+def _normalize_contract(contract: dict) -> dict:
+    """Remove execution scheduling fields from old and new run contracts."""
+    normalized = copy.deepcopy(contract)
+    normalized.pop("signature", None)
+    training = normalized.get("training", {})
+    for key in ORCHESTRATION_TRAINING_KEYS:
+        training.pop(key, None)
+    normalized["signature"] = _hash(normalized)
+    return normalized
+
+
 def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
     checkpoint_dir = config["training"]["checkpoint_dir"]
     training_contract = {
         key: copy.deepcopy(value) for key, value in config["training"].items()
-        if key not in {"checkpoint_dir", "device", "force_restart", "progress_every_rows"}
+        if key not in ORCHESTRATION_TRAINING_KEYS
     }
     # Preserve compatibility with contracts written before these opt-in
     # ownership settings existed. Their neutral defaults do not change the
@@ -111,12 +130,19 @@ def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
     if os.path.isfile(path):
         with open(path) as handle:
             previous = json.load(handle)
+        previous = _normalize_contract(previous)
         if previous != contract:
             completed = [name for name in (STAGE_A_FILE, STAGE_B_FILE, STAGE_C_FILE) if os.path.isfile(os.path.join(checkpoint_dir, name))]
             raise ValueError(
                 f"Run contract changed for checkpoint directory {checkpoint_dir}; existing stages={completed}. "
                 "Use a new RUN_NAME or deliberately set FORCE_RESTART=True."
             )
+        # Migrate historical contracts that signed the stage schedule. The
+        # normalized contract is scientifically identical and permits A/B/C
+        # to be launched as separate resumable processes.
+        with open(path + ".tmp", "w") as handle:
+            json.dump(contract, handle, indent=2, sort_keys=True)
+        os.replace(path + ".tmp", path)
     else:
         os.makedirs(checkpoint_dir, exist_ok=True)
         temporary = path + ".tmp"
