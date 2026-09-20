@@ -33,6 +33,7 @@ def comparison_table(results_by_variant: dict[str, EvaluationResult]) -> pd.Data
             row[f"{variant}__recall"] = cm.recall
             row[f"{variant}__f1"] = cm.f1
             row[f"{variant}__roc_auc_ovr"] = cm.roc_auc_ovr
+            row[f"{variant}__pr_auc_ovr"] = cm.pr_auc_ovr
             row[f"{variant}__support"] = cm.support
         rows.append(row)
     df = pd.DataFrame(rows)
@@ -43,6 +44,7 @@ def comparison_table(results_by_variant: dict[str, EvaluationResult]) -> pd.Data
         summary[f"{variant}__recall"] = result.macro_recall
         summary[f"{variant}__f1"] = result.macro_f1
         summary[f"{variant}__roc_auc_ovr"] = result.roc_auc_ovr_macro
+        summary[f"{variant}__pr_auc_ovr"] = result.pr_auc_ovr_macro
         summary[f"{variant}__support"] = sum(cm.support for cm in result.per_class)
     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
 
@@ -52,6 +54,7 @@ def comparison_table(results_by_variant: dict[str, EvaluationResult]) -> pd.Data
         micro[f"{variant}__recall"] = result.micro_recall
         micro[f"{variant}__f1"] = result.micro_f1
         micro[f"{variant}__roc_auc_ovr"] = result.roc_auc_ovr_micro
+        micro[f"{variant}__pr_auc_ovr"] = result.pr_auc_ovr_micro
         micro[f"{variant}__support"] = sum(cm.support for cm in result.per_class)
     df = pd.concat([df, pd.DataFrame([micro])], ignore_index=True)
 
@@ -61,6 +64,7 @@ def comparison_table(results_by_variant: dict[str, EvaluationResult]) -> pd.Data
         ref[f"{variant}__recall"] = result.weighted_recall
         ref[f"{variant}__f1"] = result.weighted_f1
         ref[f"{variant}__roc_auc_ovr"] = result.roc_auc_ovr_weighted
+        ref[f"{variant}__pr_auc_ovr"] = result.pr_auc_ovr_weighted
         ref[f"{variant}__support"] = sum(cm.support for cm in result.per_class)
     df = pd.concat([df, pd.DataFrame([ref])], ignore_index=True)
     return df
@@ -92,6 +96,9 @@ def per_dataset_comparison_table(results_by_variant_and_dataset: dict[str, dict[
             row[f"{variant}__roc_auc_ovr_macro"] = result.roc_auc_ovr_macro if result else float("nan")
             row[f"{variant}__roc_auc_ovr_weighted"] = result.roc_auc_ovr_weighted if result else float("nan")
             row[f"{variant}__roc_auc_ovr_micro"] = result.roc_auc_ovr_micro if result else float("nan")
+            row[f"{variant}__pr_auc_ovr_macro"] = result.pr_auc_ovr_macro if result else float("nan")
+            row[f"{variant}__pr_auc_ovr_weighted"] = result.pr_auc_ovr_weighted if result else float("nan")
+            row[f"{variant}__pr_auc_ovr_micro"] = result.pr_auc_ovr_micro if result else float("nan")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -155,7 +162,11 @@ def write_tracker_csvs(
             "roc_auc_ovr_macro": result.roc_auc_ovr_macro,
             "roc_auc_ovr_weighted": result.roc_auc_ovr_weighted,
             "roc_auc_ovr_micro": result.roc_auc_ovr_micro,
+            "pr_auc_ovr_macro": result.pr_auc_ovr_macro,
+            "pr_auc_ovr_weighted": result.pr_auc_ovr_weighted,
+            "pr_auc_ovr_micro": result.pr_auc_ovr_micro,
             "roc_auc_method": "exact",
+            "pr_auc_method": "exact",
         }
         for variant, result in results_by_variant.items()
     ]
@@ -180,6 +191,7 @@ def write_tracker_csvs(
                     "recall": cm.recall,
                     "f1": cm.f1,
                     "roc_auc_ovr": cm.roc_auc_ovr,
+                    "pr_auc_ovr": cm.pr_auc_ovr,
                     "recall_ci_low": recall_ci.ci_low if recall_ci else None,
                     "recall_ci_high": recall_ci.ci_high if recall_ci else None,
                     "f1_ci_low": f1_ci.ci_low if f1_ci else None,
@@ -213,7 +225,11 @@ def write_tracker_csvs(
                         "roc_auc_ovr_macro": result.roc_auc_ovr_macro,
                         "roc_auc_ovr_weighted": result.roc_auc_ovr_weighted,
                         "roc_auc_ovr_micro": result.roc_auc_ovr_micro,
+                        "pr_auc_ovr_macro": result.pr_auc_ovr_macro,
+                        "pr_auc_ovr_weighted": result.pr_auc_ovr_weighted,
+                        "pr_auc_ovr_micro": result.pr_auc_ovr_micro,
                         "roc_auc_method": "exact",
+                        "pr_auc_method": "exact",
                     }
                 )
         pd.DataFrame(per_dataset_rows).to_csv(os.path.join(output_dir, "Per_Dataset_Metrics.csv"), index=False)

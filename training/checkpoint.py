@@ -105,10 +105,18 @@ def save_stage_a(
     encoder_state: dict,
     class_names: list[str],
     metadata: dict | None = None,
+    representation_state: dict | None = None,
+    representation_config: dict | None = None,
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     _atomic_torch_save(
-        {"encoder_state": encoder_state, "class_names": class_names, "metadata": metadata},
+        {
+            "encoder_state": encoder_state,
+            "class_names": class_names,
+            "metadata": metadata,
+            "representation_state": representation_state,
+            "representation_config": representation_config,
+        },
         os.path.join(checkpoint_dir, STAGE_A_FILE),
     )
 
@@ -145,6 +153,26 @@ def load_validated_stage_a(config: dict, expected_metadata: dict) -> dict:
     }
     if mismatches:
         raise ValueError(f"Incompatible Stage-A checkpoint {path}: {mismatches}")
+    configured_representation = config.get("training", {}).get("representation", {})
+    configured_objective = configured_representation.get("objective", "ce")
+    configured_sampling = configured_representation.get("sampling", "legacy")
+    if (configured_objective, configured_sampling) != ("ce", "legacy"):
+        checkpoint_representation = checkpoint.get("representation_config")
+        if checkpoint_representation is None:
+            raise ValueError(
+                f"Stage-A checkpoint {path} does not record a representation objective; "
+                "regenerate it for this non-legacy configuration"
+            )
+        mismatched_representation = {
+            key: {"expected": value, "actual": checkpoint_representation.get(key)}
+            for key, value in configured_representation.items()
+            if checkpoint_representation.get(key) != value
+        }
+        if mismatched_representation:
+            raise ValueError(
+                f"Incompatible Stage-A representation checkpoint {path}: "
+                f"{mismatched_representation}"
+            )
     return checkpoint
 
 

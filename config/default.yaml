@@ -240,6 +240,16 @@ training:
   stage_a_checkpoint: null
   batch_size: 256
   min_per_class_per_batch: 4
+  # Stage-A representation objective. Defaults preserve the historical path.
+  representation:
+    objective: ce  # ce | supcon | balanced_supcon | center | arcface
+    sampling: legacy  # legacy | class_domain_balanced
+    class_weighting: legacy  # legacy | none
+    weight: 0.1
+    temperature: 0.1
+    center_weight: 0.01
+    arc_margin: 0.3
+    arc_scale: 30.0
   epochs_a: 20
   epochs_b: 15
   epochs_c: 20
@@ -293,6 +303,14 @@ evaluation:
   bootstrap_n: 1000
   bootstrap_seed: 0
   prediction_chunk_rows: 262144
+  latent:
+    max_train_rows: 20000
+    max_eval_rows: 5000
+    max_silhouette_rows: 5000
+    max_per_class_dataset: 250
+    batch_size: 4096
+    knn_neighbors: 5
+    random_seed: 0
   # Full-data ROC-AUC uses bounded-memory score histograms. Higher values
   # reduce quantization error at a small (classes x experts x bins) RAM cost.
   roc_auc_bins: 4096

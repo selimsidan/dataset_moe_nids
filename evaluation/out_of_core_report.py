@@ -49,6 +49,25 @@ def _auc_from_counts(positive: np.ndarray, negative: np.ndarray) -> float:
     return float(np.sum(widths * heights))
 
 
+def _average_precision_from_counts(positive: np.ndarray, negative: np.ndarray) -> float:
+    """Histogram approximation of one-vs-rest average precision."""
+    positives = int(positive.sum())
+    negatives = int(negative.sum())
+    if positives == 0 or negatives == 0:
+        return float("nan")
+    true_positive = np.cumsum(positive[::-1], dtype=np.float64)
+    false_positive = np.cumsum(negative[::-1], dtype=np.float64)
+    precision = np.divide(
+        true_positive,
+        true_positive + false_positive,
+        out=np.ones_like(true_positive),
+        where=(true_positive + false_positive) != 0,
+    )
+    recall = true_positive / positives
+    recall_increment = np.diff(np.r_[0.0, recall])
+    return float(np.sum(recall_increment * precision))
+
+
 def _roc_from_histograms(positive: np.ndarray, negative: np.ndarray) -> dict:
     per_class = np.asarray(
         [_auc_from_counts(positive[i], negative[i]) for i in range(len(positive))],
@@ -56,14 +75,28 @@ def _roc_from_histograms(positive: np.ndarray, negative: np.ndarray) -> dict:
     )
     support = positive.sum(axis=1)
     valid = np.isfinite(per_class)
+    per_class_pr = np.asarray(
+        [_average_precision_from_counts(positive[i], negative[i]) for i in range(len(positive))],
+        dtype=np.float64,
+    )
+    valid_pr = np.isfinite(per_class_pr)
     return {
         "per_class": per_class,
+        "per_class_pr": per_class_pr,
         "roc_auc_ovr_macro": float(per_class[valid].mean()) if valid.any() else float("nan"),
         "roc_auc_ovr_weighted": (
             float(np.average(per_class[valid], weights=support[valid]))
             if valid.any() and support[valid].sum() else float("nan")
         ),
         "roc_auc_ovr_micro": _auc_from_counts(positive.sum(axis=0), negative.sum(axis=0)),
+        "pr_auc_ovr_macro": float(per_class_pr[valid_pr].mean()) if valid_pr.any() else float("nan"),
+        "pr_auc_ovr_weighted": (
+            float(np.average(per_class_pr[valid_pr], weights=support[valid_pr]))
+            if valid_pr.any() and support[valid_pr].sum() else float("nan")
+        ),
+        "pr_auc_ovr_micro": _average_precision_from_counts(
+            positive.sum(axis=0), negative.sum(axis=0)
+        ),
     }
 
 
@@ -112,6 +145,9 @@ def _overall_from_confusion(
         "roc_auc_ovr_macro": roc_metrics["roc_auc_ovr_macro"] if roc_metrics else float("nan"),
         "roc_auc_ovr_weighted": roc_metrics["roc_auc_ovr_weighted"] if roc_metrics else float("nan"),
         "roc_auc_ovr_micro": roc_metrics["roc_auc_ovr_micro"] if roc_metrics else float("nan"),
+        "pr_auc_ovr_macro": roc_metrics["pr_auc_ovr_macro"] if roc_metrics else float("nan"),
+        "pr_auc_ovr_weighted": roc_metrics["pr_auc_ovr_weighted"] if roc_metrics else float("nan"),
+        "pr_auc_ovr_micro": roc_metrics["pr_auc_ovr_micro"] if roc_metrics else float("nan"),
     }
 
 
@@ -120,6 +156,7 @@ def _class_rows(
     class_names: list[str],
     origin: str,
     per_class_roc_auc: np.ndarray | None = None,
+    per_class_pr_auc: np.ndarray | None = None,
 ) -> list[dict]:
     total = int(confusion.sum())
     rows = []
@@ -144,6 +181,10 @@ def _class_rows(
             "roc_auc_ovr": (
                 float(per_class_roc_auc[index])
                 if per_class_roc_auc is not None else float("nan")
+            ),
+            "pr_auc_ovr": (
+                float(per_class_pr_auc[index])
+                if per_class_pr_auc is not None else float("nan")
             ),
             "false_positive_rate": 1.0 - specificity,
             "false_negative_rate": 1.0 - recall,
@@ -317,14 +358,19 @@ def evaluate_and_report_ooc(
                 roc_metrics,
             ),
             "roc_auc_method": f"histogram_approximation_{roc_bins}_bins",
+            "pr_auc_method": f"histogram_approximation_{roc_bins}_bins",
         })
         per_class_rows.extend(
-            _class_rows(confusion, data.class_names, origin, roc_metrics["per_class"])
+            _class_rows(
+                confusion, data.class_names, origin,
+                roc_metrics["per_class"], roc_metrics["per_class_pr"],
+            )
         )
 
     overall = pd.DataFrame(overall_rows)
     per_class = pd.DataFrame(per_class_rows)
     per_class["roc_auc_method"] = f"histogram_approximation_{roc_bins}_bins"
+    per_class["pr_auc_method"] = f"histogram_approximation_{roc_bins}_bins"
     gate = pd.DataFrame(gate_sum_rows)
     expert_performance_rows = []
     for origin, expert_confusions in expert_confusion_by_origin.items():
@@ -341,6 +387,7 @@ def evaluate_and_report_ooc(
                     expert_confusions[expert_index], native_indices_by_origin[origin], expert_roc
                 ),
                 "roc_auc_method": f"histogram_approximation_{roc_bins}_bins",
+                "pr_auc_method": f"histogram_approximation_{roc_bins}_bins",
             })
     expert_performance = pd.DataFrame(expert_performance_rows)
     utilization_frame = pd.DataFrame([

@@ -29,6 +29,10 @@ def test_multiclass_roc_auc_is_reported_at_all_levels():
     assert result.roc_auc_ovr_weighted == 1.0
     assert result.roc_auc_ovr_micro == 1.0
     assert [metric.roc_auc_ovr for metric in result.per_class] == [1.0, 1.0, 1.0]
+    assert result.pr_auc_ovr_macro == 1.0
+    assert result.pr_auc_ovr_weighted == 1.0
+    assert result.pr_auc_ovr_micro == 1.0
+    assert [metric.pr_auc_ovr for metric in result.per_class] == [1.0, 1.0, 1.0]
 
 
 def test_absent_class_auc_is_nan_but_valid_classes_are_aggregated():
@@ -88,11 +92,14 @@ def test_tracker_csvs_include_roc_auc_overall_per_dataset_and_per_class(tmp_path
     dataset_header = (tmp_path / "Per_Dataset_Metrics.csv").read_text().splitlines()[0]
     class_header = (tmp_path / "Per_Class_Metrics.csv").read_text().splitlines()[0]
     assert "roc_auc_ovr_macro" in overall_header
+    assert "pr_auc_ovr_macro" in overall_header
     assert "weighted_precision" in overall_header
     assert "weighted_recall" in overall_header
     assert "weighted_f1" in overall_header
     assert "micro_precision" in overall_header
     assert "micro_recall" in overall_header
     assert "roc_auc_ovr_macro" in dataset_header
+    assert "pr_auc_ovr_macro" in dataset_header
     assert "weighted_precision" in dataset_header
     assert "roc_auc_ovr" in class_header
+    assert "pr_auc_ovr" in class_header

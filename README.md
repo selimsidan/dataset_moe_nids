@@ -141,6 +141,14 @@ private encoder per expert, trains/evaluates the dense task-driven soft MoE,
 and reports private-minus-shared metric deltas alongside the extra parameter
 and MAC cost.
 
+[`notebooks/17_colab_discriminative_latent_private_encoder_moe.ipynb`](notebooks/17_colab_discriminative_latent_private_encoder_moe.ipynb)
+keeps notebook 16's private-encoder topology but trains a new Stage-A encoder
+with a configurable discriminative objective (`supcon`, `balanced_supcon`,
+`center`, or `arcface`). It reports original-space geometry, frozen probes,
+and reproducible PCA/UMAP views for Stage A, every private Stage-B encoder,
+and the Stage-C gate/expert encoders. The default `ce`/`legacy` training
+configuration remains backwards-compatible with earlier runs.
+
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks

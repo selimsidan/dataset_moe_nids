@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_fscore_support, roc_auc_score
 
 
 @dataclass
@@ -31,6 +31,7 @@ class ClassMetrics:
     recall: float
     f1: float
     roc_auc_ovr: float
+    pr_auc_ovr: float
 
 
 @dataclass
@@ -51,6 +52,9 @@ class EvaluationResult:
     roc_auc_ovr_macro: float
     roc_auc_ovr_weighted: float
     roc_auc_ovr_micro: float
+    pr_auc_ovr_macro: float
+    pr_auc_ovr_weighted: float
+    pr_auc_ovr_micro: float
     confusion: np.ndarray = field(repr=False)
 
 
@@ -90,6 +94,28 @@ def _roc_auc_ovr(
     return per_class, macro, weighted, micro
 
 
+def _pr_auc_ovr(
+    y_true: np.ndarray, y_score: np.ndarray | None, num_classes: int
+) -> tuple[np.ndarray, float, float, float]:
+    per_class = np.full(num_classes, np.nan, dtype=np.float64)
+    if y_score is None:
+        return per_class, float("nan"), float("nan"), float("nan")
+    support = np.bincount(y_true, minlength=num_classes).astype(np.float64)
+    for class_idx in range(num_classes):
+        binary_truth = y_true == class_idx
+        if binary_truth.any() and (~binary_truth).any():
+            per_class[class_idx] = average_precision_score(binary_truth, y_score[:, class_idx])
+    valid = np.isfinite(per_class)
+    macro = float(per_class[valid].mean()) if valid.any() else float("nan")
+    weighted = (
+        float(np.average(per_class[valid], weights=support[valid]))
+        if valid.any() and support[valid].sum() else float("nan")
+    )
+    one_hot = np.eye(num_classes, dtype=np.uint8)[y_true]
+    micro = float(average_precision_score(one_hot.ravel(), y_score.ravel())) if len(y_true) else float("nan")
+    return per_class, macro, weighted, micro
+
+
 def evaluate_predictions(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -107,10 +133,13 @@ def evaluate_predictions(
     per_class_auc, roc_macro, roc_weighted, roc_micro = _roc_auc_ovr(
         y_true, y_score, len(class_names)
     )
+    per_class_pr, pr_macro, pr_weighted, pr_micro = _pr_auc_ovr(
+        y_true, y_score, len(class_names)
+    )
     per_class = [
         ClassMetrics(
             class_names[i], int(support[i]), float(precision[i]), float(recall[i]),
-            float(f1[i]), float(per_class_auc[i]),
+            float(f1[i]), float(per_class_auc[i]), float(per_class_pr[i]),
         )
         for i in labels
     ]
@@ -141,6 +170,9 @@ def evaluate_predictions(
         roc_auc_ovr_macro=roc_macro,
         roc_auc_ovr_weighted=roc_weighted,
         roc_auc_ovr_micro=roc_micro,
+        pr_auc_ovr_macro=pr_macro,
+        pr_auc_ovr_weighted=pr_weighted,
+        pr_auc_ovr_micro=pr_micro,
         confusion=cm,
     )
 

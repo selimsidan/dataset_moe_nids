@@ -11,9 +11,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models.encoder import ProbeHead, SharedEncoder
+from models.encoder import SharedEncoder
 from models.losses import dataset_aux_loss, load_balance_penalty
 from models.moe import MoEDatasetNIDS
+from models.representation_losses import StageARepresentationObjective, representation_config
 
 from .checkpoint import (
     STAGE_A_FILE,
@@ -40,6 +41,7 @@ from .model_utils import (
 )
 from .out_of_core_data import OutOfCoreContext, class_counts
 from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
+from .sampler import class_domain_balanced_row_batches
 
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
@@ -72,6 +74,19 @@ def ensure_run_contract(config: dict, context: OutOfCoreContext) -> dict:
         stage_b_contract.pop("warmstart_mode", None)
     if not stage_b_contract:
         training_contract.pop("stage_b", None)
+    representation_contract = training_contract.get("representation", {})
+    neutral_representation = {
+        "objective": "ce",
+        "sampling": "legacy",
+        "class_weighting": "legacy",
+        "weight": 0.1,
+        "temperature": 0.1,
+        "center_weight": 0.01,
+        "arc_margin": 0.3,
+        "arc_scale": 30.0,
+    }
+    if all(representation_contract.get(key, value) == value for key, value in neutral_representation.items()):
+        training_contract.pop("representation", None)
     model_contract = copy.deepcopy(config["model"])
     # Preserve existing dense-run signatures written before routing became
     # configurable. Only the non-default sparse choice changes the contract.
@@ -234,12 +249,20 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         latent_dim=model_cfg["latent_dim"], activation=model_cfg["encoder"]["activation"],
         dropout=model_cfg["encoder"]["dropout"],
     ).to(device)
-    probe = ProbeHead(model_cfg["latent_dim"], len(data.class_names)).to(device)
+    objective = StageARepresentationObjective(
+        model_cfg["latent_dim"], len(data.class_names), config
+    ).to(device)
     optimizer = torch.optim.Adam(
-        [*encoder.parameters(), *probe.parameters()], lr=config["training"]["lr"],
+        [*encoder.parameters(), *objective.parameters()], lr=config["training"]["lr"],
         weight_decay=config["training"].get("weight_decay", 0.0),
     )
-    weights = _loss_weights(data.train.class_idx, len(data.class_names), device)
+    representation = representation_config(config)
+    if representation["class_weighting"] == "legacy":
+        weights = _loss_weights(data.train.class_idx, len(data.class_names), device)
+    elif representation["class_weighting"] == "none":
+        weights = None
+    else:
+        raise ValueError("training.representation.class_weighting must be legacy or none")
     checkpoint_dir = config["training"]["checkpoint_dir"]
     start_epoch = 0
     optimizer_steps = 0
@@ -248,7 +271,10 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     progress = load_progress(checkpoint_dir, "A")
     if progress:
         encoder.load_state_dict(progress["encoder_state"])
-        probe.load_state_dict(progress["probe_state"])
+        if "objective_state" in progress:
+            objective.load_state_dict(progress["objective_state"])
+        else:
+            objective.classifier.load_state_dict(progress["probe_state"])
         optimizer.load_state_dict(progress["optimizer_state"])
         start_epoch = int(progress["epoch"])
         optimizer_steps = int(progress.get("optimizer_steps", 0))
@@ -258,24 +284,45 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for epoch in range(start_epoch, int(config["training"]["epochs_a"])):
         rng = np.random.default_rng(config.get("seed", 0) + epoch)
-        encoder.train(); probe.train()
-        loss_sum = 0.0; rows_seen = 0
+        encoder.train(); objective.train()
+        totals = {"ce": 0.0, "metric": 0.0, "total": 0.0}; rows_seen = 0
         report_progress = _progress_reporter(
             f"Stage A/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
         )
-        for row_ids in shuffled_row_batches(0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks):
+        sampling = representation_config(config)["sampling"]
+        if sampling == "legacy":
+            batches = shuffled_row_batches(
+                0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks
+            )
+        elif sampling == "class_domain_balanced":
+            batches = class_domain_balanced_row_batches(
+                data.train.class_idx,
+                data.train.dataset_idx,
+                batch_size,
+                int(config["training"].get("min_per_class_per_batch", 4)),
+                seed=config.get("seed", 0) + epoch,
+            )
+        else:
+            raise ValueError("training.representation.sampling must be legacy or class_domain_balanced")
+        for row_ids in batches:
             features, labels, _ = _batch(data.train, row_ids, device)
             optimizer.zero_grad(set_to_none=True)
-            loss = F.cross_entropy(probe(encoder(features)), labels, weight=weights)
+            loss, parts, _logits = objective(encoder(features), labels, weights)
             loss.backward(); optimizer.step()
             optimizer_steps += 1; examples_seen += len(row_ids)
-            loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
+            for name in totals:
+                totals[name] += float(parts[name].item()) * len(row_ids)
+            rows_seen += len(row_ids)
             report_progress(rows_seen)
         report_progress(rows_seen, force=True)
-        print(f"[Stage A/ooc] epoch {epoch + 1}: CE={loss_sum / rows_seen:.6f} rows={rows_seen:,}")
+        print(
+            f"[Stage A/ooc] epoch {epoch + 1}: objective={objective.objective} "
+            f"CE={totals['ce'] / rows_seen:.6f} metric={totals['metric'] / rows_seen:.6f} "
+            f"total={totals['total'] / rows_seen:.6f} rows={rows_seen:,}"
+        )
         save_progress(checkpoint_dir, "A", {
             "epoch": epoch + 1, "encoder_state": encoder.state_dict(),
-            "probe_state": probe.state_dict(), "optimizer_state": optimizer.state_dict(),
+            "objective_state": objective.state_dict(), "optimizer_state": optimizer.state_dict(),
             "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
         })
     combined_split_signature = _hash(context.split_signatures)
@@ -297,6 +344,8 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         encoder.state_dict(),
         data.class_names,
         metadata=metadata,
+        representation_state=objective.state_dict(),
+        representation_config=representation_config(config),
     )
     clear_progress(checkpoint_dir, "A")
     return encoder
