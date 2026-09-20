@@ -14,11 +14,14 @@ from models.dataset_experts import DatasetExpertBank
 from models.encoder import SharedEncoder
 from models.gate import Gate
 from models.moe import MoEDatasetNIDS
+from models.private_encoder_experts import PrivateEncoderExpertBank
 
 ADAPTER_ARCHITECTURES = {"moe_dataset_adapters"}
 BASIC_MOE_ARCHITECTURES = {"moe_basic"}
+PRIVATE_ENCODER_ARCHITECTURES = {"moe_dataset_private_encoders"}
 DATASET_MOE_ARCHITECTURES = {
-    "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex", "moe_dataset_adapters"
+    "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
+    "moe_dataset_adapters", "moe_dataset_private_encoders",
 }
 
 
@@ -171,10 +174,21 @@ def expert_names_for_architecture(architecture: str, dataset_names: list[str]) -
 
 
 def bank_kind_for_architecture(architecture: str) -> str:
-    return "adapter" if architecture in ADAPTER_ARCHITECTURES else "full"
+    if architecture in ADAPTER_ARCHITECTURES:
+        return "adapter"
+    if architecture in PRIVATE_ENCODER_ARCHITECTURES:
+        return "private_encoder"
+    return "full"
 
 
-def build_expert_bank(bank_kind: str, dataset_names: list[str], latent_dim: int, num_classes: int, model_cfg: dict) -> nn.Module:
+def build_expert_bank(
+    bank_kind: str,
+    dataset_names: list[str],
+    latent_dim: int,
+    num_classes: int,
+    model_cfg: dict,
+    input_dim: int | None = None,
+) -> nn.Module:
     if bank_kind == "adapter":
         adapter_cfg = model_cfg.get("adapter", {})
         return AdapterExpertBank(
@@ -193,7 +207,39 @@ def build_expert_bank(bank_kind: str, dataset_names: list[str], latent_dim: int,
             hidden_dims=expert_cfg["hidden_dims"],
             dropout=expert_cfg["dropout"],
         )
-    raise ValueError(f"Unknown bank_kind '{bank_kind}'. Expected 'full' or 'adapter'.")
+    if bank_kind == "private_encoder":
+        if input_dim is None:
+            raise ValueError("private_encoder banks require input_dim")
+        encoder_cfg = model_cfg["encoder"]
+        expert_cfg = model_cfg["expert"]
+        return PrivateEncoderExpertBank(
+            dataset_names=dataset_names,
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            num_classes=num_classes,
+            encoder_hidden_dims=encoder_cfg["hidden_dims"],
+            expert_hidden_dims=expert_cfg["hidden_dims"],
+            activation=encoder_cfg["activation"],
+            encoder_dropout=encoder_cfg["dropout"],
+            expert_dropout=expert_cfg["dropout"],
+        )
+    raise ValueError(
+        f"Unknown bank_kind '{bank_kind}'. Expected 'full', 'adapter', or 'private_encoder'."
+    )
+
+
+def initialize_private_expert_encoders(bank: nn.Module, stage_a_encoder: SharedEncoder) -> None:
+    """Clone Stage-A weights when the bank owns full private encoders."""
+    if isinstance(bank, PrivateEncoderExpertBank):
+        bank.initialize_encoders(stage_a_encoder)
+
+
+def model_encoder_modules(model: MoEDatasetNIDS) -> list[SharedEncoder]:
+    """All encoder modules controlled by ``training.stage_c_unfreeze``."""
+    encoders = [model.encoder]
+    if isinstance(model.expert_bank, PrivateEncoderExpertBank):
+        encoders.extend(model.expert_bank.encoders)
+    return encoders
 
 
 def expert_train_params(bank: nn.Module, dataset_idx: int) -> list[torch.nn.Parameter]:
@@ -211,7 +257,7 @@ def expert_train_params(bank: nn.Module, dataset_idx: int) -> list[torch.nn.Para
     return list(bank.experts[dataset_idx].parameters())
 
 
-def expert_forward_one(bank: nn.Module, dataset_idx: int, z: torch.Tensor) -> torch.Tensor:
+def expert_forward_one(bank: nn.Module, dataset_idx: int, representation: torch.Tensor) -> torch.Tensor:
     """Runs only dataset `dataset_idx`'s expert (not the whole bank) -- used
     exclusively by Stage B's per-dataset independent training loop, where
     running every expert on every batch would be wasted compute (Stage B
@@ -219,8 +265,8 @@ def expert_forward_one(bank: nn.Module, dataset_idx: int, z: torch.Tensor) -> to
     bank forward or the config-selected top-1 grouped dispatch path.
     """
     if isinstance(bank, AdapterExpertBank):
-        return bank.shared_head(bank.adapters[dataset_idx](z))
-    return bank.experts[dataset_idx](z)
+        return bank.shared_head(bank.adapters[dataset_idx](representation))
+    return bank.experts[dataset_idx](representation)
 
 
 def build_model(
@@ -232,7 +278,15 @@ def build_model(
 ) -> MoEDatasetNIDS:
     bank_kind = bank_kind_for_architecture(architecture)
     expert_names = expert_names_for_architecture(architecture, dataset_names)
-    bank = build_expert_bank(bank_kind, expert_names, model_cfg["latent_dim"], len(class_names), model_cfg)
+    first_linear = next(layer for layer in encoder.net if isinstance(layer, nn.Linear))
+    bank = build_expert_bank(
+        bank_kind,
+        expert_names,
+        model_cfg["latent_dim"],
+        len(class_names),
+        model_cfg,
+        input_dim=first_linear.in_features,
+    )
     gate = Gate(model_cfg["latent_dim"], len(dataset_names), model_cfg["gate"]["hidden_dims"])
     routing_mode = model_cfg.get("gate", {}).get("routing", "dense")
     return MoEDatasetNIDS(encoder, bank, gate, class_names, routing_mode=routing_mode)

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from data import paths
 from data.out_of_core import class_split_quotas, prepare_dataset
@@ -59,7 +60,8 @@ def test_bounded_shuffle_uses_every_row_once_and_mixes_blocks():
     assert len(np.unique(batches[0] // 100)) > 1
 
 
-def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path):
+@pytest.mark.parametrize("architecture", ["moe_dataset_soft", "moe_dataset_private_encoders"])
+def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
     rng = np.random.default_rng(4)
 
     def split(n):
@@ -78,7 +80,7 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path):
     }
     context = OutOfCoreContext(data, prepared, {"A": "a", "B": "b"}, "prep", "unused", [f"f{i}" for i in range(6)])
     config = {
-        "run_name": "synthetic", "seed": 0, "architecture": "moe_dataset_soft",
+        "run_name": "synthetic", "seed": 0, "architecture": architecture,
         "model": {
             "latent_dim": 8,
             "encoder": {"hidden_dims": [12], "activation": "relu", "dropout": 0.0},

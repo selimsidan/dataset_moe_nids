@@ -38,6 +38,7 @@ from .model_utils import (
     expert_forward_one,
     expert_names_for_architecture,
     expert_train_params,
+    initialize_private_expert_encoders,
 )
 from .sampler import ClassBalancedBatchSampler
 
@@ -85,10 +86,16 @@ def run_stage_b(config: dict, data: PreparedData):
     active_datasets = data.active_datasets
     model_cfg = config["model"]
     bank_kind = bank_kind_for_architecture(config["architecture"])
+    input_dim = data.train.features.shape[1] if bank_kind == "private_encoder" else None
 
     expert_names = expert_names_for_architecture(config["architecture"], active_datasets)
     expert_bank = build_expert_bank(
-        bank_kind, expert_names, model_cfg["latent_dim"], len(data.class_names), model_cfg
+        bank_kind,
+        expert_names,
+        model_cfg["latent_dim"],
+        len(data.class_names),
+        model_cfg,
+        input_dim=input_dim,
     ).to(device)
     checkpoint_dir = config["training"]["checkpoint_dir"]
     warmstart_mode = config["training"].get("stage_b", {}).get("warmstart_mode", "dataset")
@@ -116,6 +123,7 @@ def run_stage_b(config: dict, data: PreparedData):
         raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
 
     encoder = _build_frozen_encoder(config, data, device)
+    initialize_private_expert_encoders(expert_bank, encoder)
 
     dataset = HarmonizedTensorDataset(data.train)
     all_class_idx = data.train.class_idx
@@ -169,9 +177,12 @@ def run_stage_b(config: dict, data: PreparedData):
             total_loss, n_batches = 0.0, 0
             for features, class_idx, _dataset_idx in loader:
                 features, class_idx = features.to(device), class_idx.to(device)
-                with torch.no_grad():
-                    z = encoder(features)
-                logits = expert_forward_one(expert_bank, i, z)
+                if getattr(expert_bank, "expects_raw_input", False):
+                    expert_input = features
+                else:
+                    with torch.no_grad():
+                        expert_input = encoder(features)
+                logits = expert_forward_one(expert_bank, i, expert_input)
                 loss = F.cross_entropy(logits, class_idx)
 
                 optimizer.zero_grad()

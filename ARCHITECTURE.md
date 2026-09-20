@@ -66,9 +66,11 @@ raw row (dataset-specific schema)
               (C = 1 + len(active_classes), class order [Benign, *active_classes])
 ```
 
-The model is `MoEDatasetNIDS` (`models/moe.py`), wiring exactly three
-submodules: `SharedEncoder`, an expert bank (`DatasetExpertBank` or
-`AdapterExpertBank`), and `Gate`.
+The model is `MoEDatasetNIDS` (`models/moe.py`), wiring an encoder, expert
+bank, and `Gate`. In the original architectures that encoder is the shared
+expert/gate trunk. In the `moe_dataset_private_encoders` ablation it is a
+dedicated gate encoder, while each expert branch owns another complete
+encoder.
 
 ## 3. The shared encoder
 
@@ -123,6 +125,21 @@ exposes the exact same `(batch, D, num_classes)` forward contract and
 `MoEDatasetNIDS` and every training stage are agnostic to which bank
 they're wired to — selected via `training/model_utils.py::build_expert_bank`,
 the one place `architecture` maps onto a concrete bank class.
+
+### `PrivateEncoderExpertBank` — full independent representation ablation
+
+`models/private_encoder_experts.py`
+
+`architecture=moe_dataset_private_encoders` replaces shared-latent expert
+heads with complete per-dataset branches: harmonized input → private
+`SharedEncoder` instance → private `Expert` head. A separate encoder supplies
+the dataset-blind gate. Stage A remains pooled; its weights are cloned into
+the gate encoder and every private expert encoder before Stage B. Stage B then
+specializes one entire encoder+head branch per dataset. Dense and top-1
+routing retain the same probability-combination and `forward(x)` contracts.
+This is intentionally a representation-capacity ablation rather than a
+capacity-matched method, so resource accounting reports all stored and active
+private encoders explicitly.
 
 ## 5. The gate
 
@@ -212,6 +229,12 @@ touched by every dataset's warm-start in sequence, so later datasets can
 nudge it away from what earlier ones learned — expected, documented
 behavior for that ablation, not a bug (see `model_utils.py` docstring).
 Checkpointing is resumable per-dataset, per-epoch.
+
+For `moe_dataset_private_encoders`, the frozen Stage-A encoder is first
+cloned into every private branch. Stage B then optimizes the selected
+dataset's complete private encoder+head, not merely its downstream head; the
+original frozen instance is used only as the common initialization source and
+later becomes the Stage-C gate encoder.
 
 ### Stage C — Joint fine-tune (`training/stage_c_jointfinetune.py`)
 

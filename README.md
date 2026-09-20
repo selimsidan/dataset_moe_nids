@@ -58,6 +58,7 @@ data/
 models/
   encoder.py                 SharedEncoder (+ Stage-A-only ProbeHead) -- ported
   dataset_experts.py         Expert / DatasetExpertBank -- one expert PER DATASET, full task vocabulary
+  private_encoder_experts.py full private encoder+head per dataset ablation
   adapters.py                AdapterExpertBank -- FiLM-style lightweight ablation alternative
   gate.py                    Gate (softmax over dataset-experts)
   moe.py                     MoEDatasetNIDS -- soft mixture-of-experts combination rule
@@ -133,6 +134,13 @@ deployable, learned-top-1, oracle-route, confidence-bin, route-conditioned,
 per-dataset/per-class, expert-cross-dataset, and resource-accounting diagnostics
 in one top-to-bottom run.
 
+[`notebooks/16_colab_end_to_end_private_encoder_moe.ipynb`](notebooks/16_colab_end_to_end_private_encoder_moe.ipynb)
+is the paired follow-up to that diagnostic. It reuses notebook 00's exact
+Stage-A checkpoint, clones it into a dedicated gate encoder plus one full
+private encoder per expert, trains/evaluates the dense task-driven soft MoE,
+and reports private-minus-shared metric deltas alongside the extra parameter
+and MAC cost.
+
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks
@@ -207,6 +215,7 @@ python -m training.run --config config/default.yaml --set architecture=moe_basic
 python -m training.run --config config/default.yaml --set architecture=moe_dataset_hard_gate
 python -m training.run --config config/default.yaml --set architecture=moe_dataset_damex
 python -m training.run --config config/default.yaml --set architecture=moe_dataset_adapters
+python -m training.run --config config/default.yaml --set architecture=moe_dataset_private_encoders
 
 # Baselines:
 python -m training.run --config config/default.yaml --set architecture=plain_pooled

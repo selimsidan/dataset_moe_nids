@@ -95,7 +95,8 @@ def main() -> None:
             )
     if config["architecture"] not in {
         "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
-        "moe_dataset_adapters", "moe_basic", "hard_two_stage", "plain_pooled", "matched_dense", "no_fusion",
+        "moe_dataset_adapters", "moe_dataset_private_encoders", "moe_basic",
+        "hard_two_stage", "plain_pooled", "matched_dense", "no_fusion",
     }:
         raise ValueError("out_of_core_full supports MoE, dense, and hard_two_stage architectures")
     if config["training"].get("device") == "cuda" and not torch.cuda.is_available():

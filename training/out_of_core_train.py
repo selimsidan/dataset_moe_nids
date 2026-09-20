@@ -35,6 +35,8 @@ from .model_utils import (
     expert_forward_one,
     expert_names_for_architecture,
     expert_train_params,
+    initialize_private_expert_encoders,
+    model_encoder_modules,
 )
 from .out_of_core_data import OutOfCoreContext, class_counts
 from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
@@ -327,7 +329,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
     expert_names = expert_names_for_architecture(config["architecture"], data.active_datasets)
     bank = build_expert_bank(
         bank_kind, expert_names, config["model"]["latent_dim"],
-        len(data.class_names), config["model"],
+        len(data.class_names), config["model"], input_dim=data.train.features.shape[1],
     ).to(device)
     checkpoint_dir = config["training"]["checkpoint_dir"]
     warmstart_mode = config["training"].get("stage_b", {}).get("warmstart_mode", "dataset")
@@ -349,6 +351,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
 
     encoder = _frozen_encoder(config, context, device)
+    initialize_private_expert_encoders(bank, encoder)
     progress = load_progress(checkpoint_dir, "B")
     resume_dataset = 0; resume_epoch = 0; optimizer_state = None
     optimizer_steps = examples_seen = 0
@@ -380,10 +383,15 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
             )
             for row_ids in shuffled_row_batches(bounds.start, bounds.stop, rng, batch_size, block_rows, buffer_blocks):
                 features, labels, _ = _batch(data.train, row_ids, device)
-                with torch.no_grad():
-                    latent = encoder(features)
+                if getattr(bank, "expects_raw_input", False):
+                    expert_input = features
+                else:
+                    with torch.no_grad():
+                        expert_input = encoder(features)
                 optimizer.zero_grad(set_to_none=True)
-                loss = F.cross_entropy(expert_forward_one(bank, dataset_i, latent), labels, weight=weights)
+                loss = F.cross_entropy(
+                    expert_forward_one(bank, dataset_i, expert_input), labels, weight=weights
+                )
                 loss.backward(); optimizer.step()
                 optimizer_steps += 1; examples_seen += len(row_ids)
                 loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
@@ -493,7 +501,8 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     torch.manual_seed(config.get("seed", 0))
     model = build_ooc_model(config, context, device)
     stage_b_anchor = _expert_anchor(model)
-    _set_encoder_trainable(model.encoder, config["training"]["stage_c_unfreeze"])
+    for encoder in model_encoder_modules(model):
+        _set_encoder_trainable(encoder, config["training"]["stage_c_unfreeze"])
     optimizer = torch.optim.Adam(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=config["training"]["lr"], weight_decay=config["training"].get("weight_decay", 0.0),
@@ -503,7 +512,7 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     expert_update_policy = stage_cfg.get("expert_update_policy", "all")
     if expert_update_policy not in {"all", "assigned_only"}:
         raise ValueError("training.stage_c.expert_update_policy must be 'all' or 'assigned_only'")
-    if expert_update_policy == "assigned_only" and bank_kind_for_architecture(config["architecture"]) != "full":
+    if expert_update_policy == "assigned_only" and bank_kind_for_architecture(config["architecture"]) not in {"full", "private_encoder"}:
         raise ValueError("assigned_only expert updates require independent full experts, not a shared adapter head")
     anchor_lambda = float(stage_cfg.get("lambda_expert_anchor", 0.0))
     if anchor_lambda < 0:

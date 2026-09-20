@@ -54,7 +54,7 @@ from .checkpoint import (
     save_progress, save_stage_c, stage_a_metadata,
 )
 from .dataset import HarmonizedTensorDataset, PreparedData
-from .model_utils import bank_kind_for_architecture, build_model
+from .model_utils import bank_kind_for_architecture, build_model, model_encoder_modules
 from .sampler import ClassBalancedBatchSampler
 
 
@@ -156,7 +156,8 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
 
     model = build_model_from_checkpoints(config, data, device)
     stage_b_anchor = _expert_anchor(model)
-    _set_encoder_trainable(model.encoder, config["training"]["stage_c_unfreeze"])
+    for encoder in model_encoder_modules(model):
+        _set_encoder_trainable(encoder, config["training"]["stage_c_unfreeze"])
 
     lambda_balance = config["load_balance"]["lambda_balance"]
     lambda_dataset_aux = _lambda_dataset_aux(config)
@@ -166,7 +167,7 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
     if expert_update_policy not in {"all", "assigned_only"}:
         raise ValueError("training.stage_c.expert_update_policy must be 'all' or 'assigned_only'")
     bank_kind = bank_kind_for_architecture(config["architecture"])
-    if expert_update_policy == "assigned_only" and bank_kind != "full":
+    if expert_update_policy == "assigned_only" and bank_kind not in {"full", "private_encoder"}:
         raise ValueError("assigned_only expert updates require independent full experts, not a shared adapter head")
     lambda_expert_anchor = float(stage_c_cfg.get("lambda_expert_anchor", 0.0))
     if lambda_expert_anchor < 0:

@@ -1,6 +1,10 @@
-"""Wires SharedEncoder + a dataset-expert bank (DatasetExpertBank or
-AdapterExpertBank -- both share the same forward() contract) + Gate into
-`MoEDatasetNIDS`, and implements selectable dense or true top-1 routing.
+"""Wires an encoder + dataset-expert bank + Gate into ``MoEDatasetNIDS``.
+
+For the original shared-encoder architectures, the encoder output ``z`` feeds
+both the gate and expert heads.  A bank with ``expects_raw_input=True`` instead
+owns private encoders and consumes ``x`` directly; in that topology the model's
+``encoder`` is the dedicated gate encoder.  Both topologies retain the same
+dataset-blind ``forward(x)`` API and probability-mixture rule.
 
     expert_probs    = softmax(expert_logits, dim=-1)             # (B, D, C)
     combined_probs  = einsum('bd,bdc->bc', gate_weights, expert_probs)  # (B, C)
@@ -59,12 +63,26 @@ class MoEDatasetNIDS(nn.Module):
     def expert_names(self) -> list[str]:
         return list(getattr(self.expert_bank, "expert_names", self.expert_bank.dataset_names))
 
+    def gate_weights_for(self, x: torch.Tensor) -> torch.Tensor:
+        """Return gate weights without assuming how expert representations are built."""
+        return self.gate(self.encoder(x))
+
+    def all_expert_logits(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Evaluate every expert under either shared- or private-encoder topology."""
+        if getattr(self.expert_bank, "expects_raw_input", False):
+            return self.expert_bank(x)
+        return self.expert_bank(self.encoder(x) if z is None else z)
+
+    def _expert_input(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        return x if getattr(self.expert_bank, "expects_raw_input", False) else z
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         z = self.encoder(x)
         gate_weights = self.gate(z)
+        expert_input = self._expert_input(x, z)
         if self.routing_mode == "top1":
             selected_experts = gate_weights.argmax(dim=1)
-            selected_logits = self.expert_bank.forward_selected(z, selected_experts)
+            selected_logits = self.expert_bank.forward_selected(expert_input, selected_experts)
             selected_probs = F.softmax(selected_logits, dim=-1)
             return {
                 "z": z,
@@ -75,7 +93,7 @@ class MoEDatasetNIDS(nn.Module):
                 "combined_probs": selected_probs,
             }
 
-        expert_logits = self.expert_bank(z)
+        expert_logits = self.expert_bank(expert_input)
         expert_probs = F.softmax(expert_logits, dim=-1)
         combined_probs = torch.einsum("bd,bdc->bc", gate_weights, expert_probs)
         return {

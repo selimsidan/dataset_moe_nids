@@ -202,7 +202,9 @@ data:
 # moe_dataset_soft (primary) | moe_basic (generic native MoE comparator) |
 # moe_dataset_damex (strict dataset routing) |
 # moe_dataset_hard_gate (legacy hard-aux ablation) |
-# moe_dataset_adapters (ablation) | matched_dense | plain_pooled | no_fusion | hard_two_stage
+# moe_dataset_adapters (ablation) | moe_dataset_private_encoders (full private
+# encoder per expert, with a dedicated gate encoder) | matched_dense |
+# plain_pooled | no_fusion | hard_two_stage
 architecture: moe_dataset_soft
 
 model:

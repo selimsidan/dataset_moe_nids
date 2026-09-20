@@ -242,9 +242,8 @@ def run_router_diagnostics(
                     else features_moe
                 )
 
-                z = moe.encoder(features_moe)
-                gate_weights = moe.gate(z)
-                expert_logits = moe.expert_bank(z)
+                gate_weights = moe.gate_weights_for(features_moe)
+                expert_logits = moe.all_expert_logits(features_moe)
                 expert_probabilities = F.softmax(expert_logits, dim=-1)
                 moe_routes = gate_weights.argmax(dim=1)
                 oracle_routes = torch.full_like(moe_routes, dataset_index)

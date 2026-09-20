@@ -18,6 +18,7 @@ from torch import nn
 from models.adapters import AdapterExpertBank
 from models.baselines import HardTwoStageModel, MatchedDenseClassifier, NoFusionModel
 from models.moe import MoEDatasetNIDS
+from models.private_encoder_experts import PrivateEncoderExpertBank
 
 
 RESOURCE_FILE = "Resource_Accounting.csv"
@@ -98,24 +99,45 @@ def resource_profile(
     active_macs: list[int]
 
     if isinstance(model, MoEDatasetNIDS):
-        encoder_params, gate_params = parameter_count(model.encoder), parameter_count(model.gate)
-        encoder_macs, gate_macs = linear_macs(model.encoder), linear_macs(model.gate)
-        classifier_params = parameter_count(model.expert_bank)
-        classifier_macs = linear_macs(model.expert_bank)
-        if isinstance(model.expert_bank, AdapterExpertBank):
+        gate_params = parameter_count(model.gate)
+        gate_macs = linear_macs(model.gate)
+        if isinstance(model.expert_bank, PrivateEncoderExpertBank):
+            encoder_params = parameter_count(model.encoder) + sum(
+                parameter_count(expert.encoder) for expert in model.expert_bank.experts
+            )
+            encoder_macs = linear_macs(model.encoder) + sum(
+                linear_macs(expert.encoder) for expert in model.expert_bank.experts
+            )
+            classifier_params = sum(
+                parameter_count(expert.head) for expert in model.expert_bank.experts
+            )
+            classifier_macs = sum(
+                linear_macs(expert.head) for expert in model.expert_bank.experts
+            )
+            branch_p = [parameter_count(expert) for expert in model.expert_bank.experts]
+            branch_m = [linear_macs(expert) for expert in model.expert_bank.experts]
+        elif isinstance(model.expert_bank, AdapterExpertBank):
+            encoder_params, encoder_macs = parameter_count(model.encoder), linear_macs(model.encoder)
+            classifier_params = parameter_count(model.expert_bank)
+            classifier_macs = linear_macs(model.expert_bank)
             shared_p = parameter_count(model.expert_bank.shared_head)
             shared_m = linear_macs(model.expert_bank.shared_head)
             branch_p = [parameter_count(adapter) + shared_p for adapter in model.expert_bank.adapters]
             branch_m = [linear_macs(adapter) + shared_m for adapter in model.expert_bank.adapters]
         else:
+            encoder_params, encoder_macs = parameter_count(model.encoder), linear_macs(model.encoder)
+            classifier_params = parameter_count(model.expert_bank)
+            classifier_macs = linear_macs(model.expert_bank)
             branch_p = [parameter_count(expert) for expert in model.expert_bank.experts]
             branch_m = [linear_macs(expert) for expert in model.expert_bank.experts]
         if model.routing_mode == "dense":
             active_params = [parameter_count(model)]
             active_macs = [encoder_macs + gate_macs + classifier_macs]
         else:
-            active_params = [encoder_params + gate_params + value for value in branch_p]
-            active_macs = [encoder_macs + gate_macs + value for value in branch_m]
+            gate_encoder_params = parameter_count(model.encoder)
+            gate_encoder_macs = linear_macs(model.encoder)
+            active_params = [gate_encoder_params + gate_params + value for value in branch_p]
+            active_macs = [gate_encoder_macs + gate_macs + value for value in branch_m]
     elif isinstance(model, HardTwoStageModel):
         router_params = parameter_count(model.id_encoder) + parameter_count(model.id_head)
         router_macs = linear_macs(model.id_encoder) + linear_macs(model.id_head)

@@ -29,8 +29,7 @@ def compute_gate_weights(model: MoEDatasetNIDS, features: np.ndarray, batch_size
     with torch.no_grad():
         for start in range(0, len(features), batch_size):
             chunk = torch.from_numpy(features[start : start + batch_size])
-            z = model.encoder(chunk)
-            weights.append(model.gate(z).numpy())
+            weights.append(model.gate_weights_for(chunk).numpy())
     return np.concatenate(weights, axis=0)
 
 

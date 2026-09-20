@@ -229,7 +229,7 @@ def evaluate_and_report_ooc(
                 elif has_expert_bank:
                     expert_logits = output.get("expert_logits")
                     if expert_logits is None:
-                        expert_logits = model.expert_bank(output["z"])
+                        expert_logits = model.all_expert_logits(tensor, output.get("z"))
                     expert_probabilities = F.softmax(expert_logits, dim=2).cpu().numpy()
                     expert_predictions = expert_probabilities.argmax(axis=2)
                     gates = output["gate_weights"].cpu().numpy()
