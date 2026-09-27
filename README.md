@@ -149,6 +149,51 @@ and reproducible PCA/UMAP views for Stage A, every private Stage-B encoder,
 and the Stage-C gate/expert encoders. The default `ce`/`legacy` training
 configuration remains backwards-compatible with earlier runs.
 
+### Finalized greedy MoE study (notebooks 18–24)
+
+The paper-facing follow-up is defined immutably in
+[`config/greedy_moe_study.yaml`](config/greedy_moe_study.yaml) and executed by
+`training.ablation_matrix`.  It reproduces Run C on paired model/split seeds,
+performs a clean expert-head capacity sweep through `[256, 128]`, compares
+shared full heads with private encoders and rank-16 FiLM adapters, and then
+evaluates CE, SupCon, and balanced SupCon.  Winners are selected exclusively
+from Stage-C validation macro-F1; the test reports written for every run are
+never inputs to the decision logic.
+
+Run the notebooks in order:
+
+1. [`18_colab_ablation_phase0_baseline.ipynb`](notebooks/18_colab_ablation_phase0_baseline.ipynb)
+2. [`19_colab_ablation_phase1_capacity.ipynb`](notebooks/19_colab_ablation_phase1_capacity.ipynb)
+3. [`20_colab_ablation_phase2_expert_architectures.ipynb`](notebooks/20_colab_ablation_phase2_expert_architectures.ipynb)
+4. [`21_colab_ablation_phase3a_supcon_sweep.ipynb`](notebooks/21_colab_ablation_phase3a_supcon_sweep.ipynb)
+5. [`22_colab_ablation_phase3b_supcon_confirm.ipynb`](notebooks/22_colab_ablation_phase3b_supcon_confirm.ipynb)
+6. [`23_colab_ablation_phase3c_balanced_supcon.ipynb`](notebooks/23_colab_ablation_phase3c_balanced_supcon.ipynb)
+7. [`24_colab_ablation_phase4_final_report.ipynb`](notebooks/24_colab_ablation_phase4_final_report.ipynb)
+
+Each notebook first prints the exact unblocked jobs.  Set `EXECUTE=True` only
+after reviewing that dry run.  `MAX_NEW_RUNS=1` is useful when a Colab session
+should perform one evaluated configuration at a time.  The runner uses
+deterministic names, resumes partial checkpoints, skips complete runs, and
+writes `${PREFIX}_summary/study_state.json` atomically.  Later phases refuse to
+run until their prerequisite winner exists, and a changed study/default config
+requires a new prefix rather than silently mixing protocols.
+
+The CLI equivalent is:
+
+```bash
+python -m training.ablation_matrix --phase 0 --prefix nfv3_4way_greedy_v1
+python -m training.ablation_matrix --phase 0 --prefix nfv3_4way_greedy_v1 --execute
+```
+
+Every evaluated run must contain its manifest, trial metadata, overall,
+per-dataset, and per-class metrics, confusion matrix, gate/expert reports, and
+resource accounting before the state machine marks it complete.  Stage A also
+writes `Representation_Batch_Coverage.csv`, which reports per-class batch
+presence, singleton frequency, and the fraction of anchors that had a valid
+same-class contrastive positive.  Phase 4 reuses the already selected three
+runs and writes paired final tables; insurance probes remain deliberately
+deferred.
+
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks

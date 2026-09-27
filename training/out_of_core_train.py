@@ -8,6 +8,7 @@ import os
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -45,6 +46,7 @@ from .sampler import class_domain_balanced_row_batches
 
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
+REPRESENTATION_COVERAGE_FILE = "Representation_Batch_Coverage.csv"
 ORCHESTRATION_TRAINING_KEYS = {
     "checkpoint_dir",
     "device",
@@ -159,6 +161,86 @@ def _bounded_slices(length: int, batch_size: int):
         end = start + batch_size - 1 if remaining == batch_size + 1 and batch_size > 2 else min(start + batch_size, length)
         yield slice(start, end)
         start = end
+
+
+def _empty_representation_coverage(num_classes: int) -> dict[str, np.ndarray | int]:
+    return {
+        "batch_appearances": np.zeros(num_classes, dtype=np.int64),
+        "singleton_batches": np.zeros(num_classes, dtype=np.int64),
+        "anchors_seen": np.zeros(num_classes, dtype=np.int64),
+        "anchors_with_positive": np.zeros(num_classes, dtype=np.int64),
+        "batches_seen": 0,
+    }
+
+
+def _restore_representation_coverage(value: dict | None, num_classes: int) -> dict[str, np.ndarray | int]:
+    coverage = _empty_representation_coverage(num_classes)
+    if not value:
+        return coverage
+    for key in ("batch_appearances", "singleton_batches", "anchors_seen", "anchors_with_positive"):
+        restored = np.asarray(value.get(key, coverage[key]), dtype=np.int64)
+        if restored.shape != (num_classes,):
+            raise ValueError(f"Stage-A representation coverage field {key!r} has shape {restored.shape}")
+        coverage[key] = restored
+    coverage["batches_seen"] = int(value.get("batches_seen", 0))
+    return coverage
+
+
+def _update_representation_coverage(coverage: dict, labels: torch.Tensor, num_classes: int) -> None:
+    counts = torch.bincount(labels.detach(), minlength=num_classes).cpu().numpy().astype(np.int64)
+    present = counts > 0
+    valid = counts >= 2
+    coverage["batch_appearances"] += present
+    coverage["singleton_batches"] += counts == 1
+    coverage["anchors_seen"] += counts
+    coverage["anchors_with_positive"] += np.where(valid, counts, 0)
+    coverage["batches_seen"] += 1
+
+
+def _coverage_checkpoint_value(coverage: dict) -> dict:
+    return {
+        key: value.tolist() if isinstance(value, np.ndarray) else int(value)
+        for key, value in coverage.items()
+    }
+
+
+def _write_representation_coverage(checkpoint_dir: str, class_names: list[str], coverage: dict) -> str:
+    rows = []
+    for index, class_name in enumerate(class_names):
+        appearances = int(coverage["batch_appearances"][index])
+        singleton = int(coverage["singleton_batches"][index])
+        anchors = int(coverage["anchors_seen"][index])
+        valid = int(coverage["anchors_with_positive"][index])
+        rows.append({
+            "class": class_name,
+            "batches_seen": int(coverage["batches_seen"]),
+            "batch_appearances": appearances,
+            "singleton_batches": singleton,
+            "singleton_fraction_when_present": singleton / appearances if appearances else 0.0,
+            "anchors_seen": anchors,
+            "anchors_with_same_class_positive": valid,
+            "valid_anchor_fraction": valid / anchors if anchors else 0.0,
+        })
+    anchors = int(np.asarray(coverage["anchors_seen"]).sum())
+    valid = int(np.asarray(coverage["anchors_with_positive"]).sum())
+    rows.append({
+        "class": "__ALL__",
+        "batches_seen": int(coverage["batches_seen"]),
+        "batch_appearances": int(np.asarray(coverage["batch_appearances"]).sum()),
+        "singleton_batches": int(np.asarray(coverage["singleton_batches"]).sum()),
+        "singleton_fraction_when_present": (
+            float(np.asarray(coverage["singleton_batches"]).sum())
+            / max(1, int(np.asarray(coverage["batch_appearances"]).sum()))
+        ),
+        "anchors_seen": anchors,
+        "anchors_with_same_class_positive": valid,
+        "valid_anchor_fraction": valid / anchors if anchors else 0.0,
+    })
+    path = os.path.join(checkpoint_dir, REPRESENTATION_COVERAGE_FILE)
+    temporary = path + ".tmp"
+    pd.DataFrame(rows).to_csv(temporary, index=False)
+    os.replace(temporary, path)
+    return path
 
 
 def shuffled_row_batches(
@@ -293,6 +375,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     start_epoch = 0
     optimizer_steps = 0
     examples_seen = 0
+    coverage = _empty_representation_coverage(len(data.class_names))
     started = time.monotonic()
     progress = load_progress(checkpoint_dir, "A")
     if progress:
@@ -305,6 +388,9 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         start_epoch = int(progress["epoch"])
         optimizer_steps = int(progress.get("optimizer_steps", 0))
         examples_seen = int(progress.get("examples_seen", 0))
+        coverage = _restore_representation_coverage(
+            progress.get("representation_coverage"), len(data.class_names)
+        )
         print(f"[Stage A/ooc] resuming at epoch {start_epoch}")
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
@@ -332,6 +418,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             raise ValueError("training.representation.sampling must be legacy or class_domain_balanced")
         for row_ids in batches:
             features, labels, _ = _batch(data.train, row_ids, device)
+            _update_representation_coverage(coverage, labels, len(data.class_names))
             optimizer.zero_grad(set_to_none=True)
             loss, parts, _logits = objective(encoder(features), labels, weights)
             loss.backward(); optimizer.step()
@@ -350,6 +437,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             "epoch": epoch + 1, "encoder_state": encoder.state_dict(),
             "objective_state": objective.state_dict(), "optimizer_state": optimizer.state_dict(),
             "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
+            "representation_coverage": _coverage_checkpoint_value(coverage),
         })
     combined_split_signature = _hash(context.split_signatures)
     metadata = stage_a_metadata(
@@ -365,6 +453,13 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         "wall_seconds": time.monotonic() - started,
         "selected_epoch": int(config["training"]["epochs_a"]),
     }
+    _write_representation_coverage(checkpoint_dir, data.class_names, coverage)
+    anchors_seen = int(np.asarray(coverage["anchors_seen"]).sum())
+    valid_anchors = int(np.asarray(coverage["anchors_with_positive"]).sum())
+    metadata["training_summary"]["representation_valid_anchor_fraction"] = (
+        valid_anchors / anchors_seen if anchors_seen else 0.0
+    )
+    metadata["representation_coverage_file"] = REPRESENTATION_COVERAGE_FILE
     save_stage_a(
         checkpoint_dir,
         encoder.state_dict(),

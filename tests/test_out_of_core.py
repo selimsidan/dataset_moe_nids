@@ -153,6 +153,18 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
     assert reports["expert_performance"]["is_assigned_expert"].sum() == 2
     assert (tmp_path / "results" / "Per_Class_Metrics.csv").is_file()
     assert (tmp_path / "results" / "Expert_Performance_By_Dataset.csv").is_file()
+    assert (tmp_path / "results" / "Representation_Batch_Coverage.csv").is_file()
+    trials = pd.read_csv(tmp_path / "results" / "Trials.csv")
+    assert {
+        "split_seed", "encoder_hidden_dims", "expert_hidden_dims", "adapter_rank",
+        "representation_objective", "representation_weight", "representation_sampling",
+        "representation_class_weighting", "epochs_a", "epochs_b", "epochs_c_max",
+    }.issubset(trials.columns)
+    with open(tmp_path / "results" / "manifest.json") as handle:
+        manifest = json.load(handle)
+    assert manifest["trial_id"] == "synthetic-seed0"
+    assert manifest["resolved_experiment"]["expert_hidden_dims"] == [8]
+    assert "Representation_Batch_Coverage.csv" in manifest["report_files"]
 
 
 def test_two_way_configuration_builds_logical_pooled_views(tmp_path, monkeypatch):

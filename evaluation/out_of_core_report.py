@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 
 import numpy as np
@@ -14,6 +15,9 @@ from models.baselines import NoFusionModel
 from evaluation.resource_accounting import resource_profile, stage_a_checkpoint_hash, write_resource_accounting
 from training.checkpoint import resolve_stage_a_path
 from training.out_of_core_data import OutOfCoreContext
+
+
+REPRESENTATION_COVERAGE_FILE = "Representation_Batch_Coverage.csv"
 
 
 def _update_roc_histograms(
@@ -409,14 +413,28 @@ def evaluate_and_report_ooc(
         if config["architecture"] in {"plain_pooled", "matched_dense", "no_fusion", "hard_two_stage"}
         else {}
     )
+    representation_cfg = config.get("training", {}).get("representation", {})
     trials = pd.DataFrame([{
         "Trial_ID": trial_id,
         "run_name": config["run_name"], "architecture": config["architecture"],
         "routing_mode": config["model"].get("gate", {}).get("routing", "dense"),
         "gate_supervision": config["training"]["stage_c"].get("gate_supervision", "light_aux"),
         "expert_update_policy": config["training"]["stage_c"].get("expert_update_policy", "all"),
-        "seed": config.get("seed", 0), "combination_size": len(data.active_datasets),
+        "seed": config.get("seed", 0),
+        "split_seed": config.get("data", {}).get("split_seed", 0),
+        "combination_size": len(data.active_datasets),
         "active_datasets": "|".join(data.active_datasets),
+        "encoder_hidden_dims": json.dumps(config.get("model", {}).get("encoder", {}).get("hidden_dims", [])),
+        "latent_dim": config.get("model", {}).get("latent_dim"),
+        "expert_hidden_dims": json.dumps(config.get("model", {}).get("expert", {}).get("hidden_dims", [])),
+        "adapter_rank": config.get("model", {}).get("adapter", {}).get("rank"),
+        "representation_objective": representation_cfg.get("objective", "ce"),
+        "representation_weight": representation_cfg.get("weight", 0.1),
+        "representation_sampling": representation_cfg.get("sampling", "legacy"),
+        "representation_class_weighting": representation_cfg.get("class_weighting", "legacy"),
+        "epochs_a": config.get("training", {}).get("epochs_a"),
+        "epochs_b": config.get("training", {}).get("epochs_b"),
+        "epochs_c_max": config.get("training", {}).get("epochs_c"),
         "contract_signature": contract["signature"],
         "split_signature": split_signature,
         "matching_axis": config.get("model", {}).get("dense_match", {}).get("axis") if config["architecture"] == "matched_dense" else None,
@@ -460,21 +478,46 @@ def evaluate_and_report_ooc(
         os.replace(temporary, os.path.join(result_dir, filename))
     write_resource_accounting(result_dir, [resource_row])
 
+    coverage_source = os.path.join(os.path.dirname(stage_path), REPRESENTATION_COVERAGE_FILE)
+    coverage_report = os.path.join(result_dir, REPRESENTATION_COVERAGE_FILE)
+    if os.path.isfile(coverage_source):
+        temporary = coverage_report + ".tmp"
+        shutil.copy2(coverage_source, temporary)
+        os.replace(temporary, coverage_report)
+
+    report_files = [
+        "Trials.csv", "Overall_Metrics.csv", "Per_Dataset_Metrics.csv",
+        "Per_Class_Metrics.csv", "Gate_By_Dataset.csv",
+        "Expert_Performance_By_Dataset.csv", "Expert_Utilization.csv",
+        "Confusion_Matrix.csv", "Resource_Accounting.csv",
+    ]
+    if os.path.isfile(coverage_report):
+        report_files.append(REPRESENTATION_COVERAGE_FILE)
     manifest = {
         "completed_utc": datetime.now(timezone.utc).isoformat(),
+        "trial_id": trial_id,
         "run_name": config["run_name"],
         "architecture": config["architecture"],
+        "seed": int(config.get("seed", 0)),
+        "split_seed": int(config.get("data", {}).get("split_seed", 0)),
         "active_datasets": data.active_datasets,
         "class_names": data.class_names,
+        "resolved_experiment": {
+            "encoder_hidden_dims": config.get("model", {}).get("encoder", {}).get("hidden_dims", []),
+            "latent_dim": config.get("model", {}).get("latent_dim"),
+            "expert_hidden_dims": config.get("model", {}).get("expert", {}).get("hidden_dims", []),
+            "adapter_rank": config.get("model", {}).get("adapter", {}).get("rank"),
+            "routing_mode": config.get("model", {}).get("gate", {}).get("routing", "dense"),
+            "representation": representation_cfg,
+            "epochs_a": config.get("training", {}).get("epochs_a"),
+            "epochs_b": config.get("training", {}).get("epochs_b"),
+            "epochs_c_max": config.get("training", {}).get("epochs_c"),
+            "selection_mode": config.get("training", {}).get("selection_mode", "fixed_epochs"),
+        },
         "run_contract": contract,
         "prediction_files": {name: os.path.join(prediction_dir, f"{name}.npy") for name in data.active_datasets},
-        "report_files": [
-            "Trials.csv", "Overall_Metrics.csv", "Per_Dataset_Metrics.csv",
-            "Per_Class_Metrics.csv", "Gate_By_Dataset.csv",
-            "Expert_Performance_By_Dataset.csv", "Expert_Utilization.csv",
-            "Confusion_Matrix.csv",
-            "Resource_Accounting.csv",
-        ],
+        "report_files": report_files,
+        "stage_a_checkpoint": stage_path,
     }
     manifest_path = os.path.join(result_dir, "manifest.json")
     temporary = manifest_path + ".tmp"

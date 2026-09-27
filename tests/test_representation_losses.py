@@ -7,6 +7,11 @@ from models.representation_losses import (
     SupervisedContrastiveLoss,
 )
 from training.sampler import ClassDomainBalancedBatchSampler
+from training.out_of_core_train import (
+    _empty_representation_coverage,
+    _update_representation_coverage,
+    _write_representation_coverage,
+)
 
 
 def test_supcon_is_finite_and_prefers_tight_class_clusters():
@@ -55,3 +60,19 @@ def test_class_domain_sampler_supplies_cross_domain_class_positives():
             selected = batch[labels[batch] == class_id]
             assert len(selected) >= 2
             assert len(np.unique(domains[selected])) >= 2
+
+
+def test_representation_coverage_reports_singletons_and_valid_anchors(tmp_path):
+    coverage = _empty_representation_coverage(3)
+    _update_representation_coverage(coverage, torch.tensor([0, 0, 1, 2, 2, 2]), 3)
+    _update_representation_coverage(coverage, torch.tensor([0, 1, 1, 1]), 3)
+    path = _write_representation_coverage(
+        str(tmp_path), ["Benign", "Rare", "Attack"], coverage
+    )
+    import pandas as pd
+    frame = pd.read_csv(path).set_index("class")
+    assert frame.loc["Benign", "singleton_batches"] == 1
+    assert frame.loc["Rare", "singleton_batches"] == 1
+    assert frame.loc["Attack", "batch_appearances"] == 1
+    assert frame.loc["Attack", "valid_anchor_fraction"] == 1.0
+    assert 0.0 < frame.loc["__ALL__", "valid_anchor_fraction"] < 1.0
