@@ -1,0 +1,119 @@
+# Immutable v2 protocol for the bounded-regularization greedy MoE study.
+# Runtime paths, execution limits, and the study prefix remain CLI concerns.
+format_version: 1
+
+seeds: [0, 1, 2]
+
+backbone:
+  architecture: moe_dataset_soft
+  data:
+    active_datasets:
+      - NF-UNSW-NB15-v3
+      - NF-ToN-IoT-v3
+      - NF-BoT-IoT-v3
+      - NF-CICIDS2018-v3
+  model:
+    latent_dim: 64
+    encoder:
+      hidden_dims: [128]
+      activation: relu
+      dropout: 0.2
+    expert:
+      hidden_dims: []
+      dropout: 0.2
+    adapter:
+      rank: 16
+      dropout: 0.2
+    gate:
+      hidden_dims: []
+      routing: dense
+  load_balance:
+    lambda_balance: 0.1
+  training:
+    device: cuda
+    batch_size: 512
+    epochs_a: 30
+    epochs_b: 10
+    epochs_c: 30
+    lr: 0.001
+    weight_decay: 0.0
+    freeze_encoder_stage_b: true
+    selection_mode: best_val
+    early_stopping_patience: 5
+    stage_c_unfreeze: all
+    stage_b:
+      warmstart_mode: dataset
+    stage_c:
+      gate_supervision: none
+      expert_update_policy: all
+      lambda_expert_anchor: 0.0
+    representation:
+      objective: ce
+      sampling: legacy
+      class_weighting: legacy
+      weight: 0.1
+      temperature: 0.1
+      center_weight: 0.01
+      arc_margin: 0.3
+      arc_scale: 30.0
+
+# Phase 1 treats the linear head at nonzero decay as a challenger. The
+# linear/zero-decay pair is supplied by phase 0 and is not rerun here.
+capacity_candidates:
+  - []
+  - [32]
+  - [45]
+  - [64]
+  - [128]
+  - [128, 64]
+  - [256, 128]
+
+capacity_weight_decays: [0.0, 0.0001]
+
+architecture_candidates:
+  private:
+    architecture: moe_dataset_private_encoders
+  adapters:
+    architecture: moe_dataset_adapters
+    rank: 16
+
+supcon_weights: [0.1, 0.2, 0.3, 0.5]
+
+selection:
+  metric: best_validation_macro_f1
+  exact_tolerance: 1.0e-12
+  capacity_tie_break: fewer_parameters_then_lower_weight_decay
+  architecture_tie_break: shared_incumbent
+  weight_tie_break: lower_weight
+  representation_tie_order: [ce, supcon, balanced_supcon]
+
+# Latent reporting is part of the v2 evidence bundle. Core C-stage metrics are
+# required for every evaluated run. Phase 4 upgrades the three baseline and
+# three winner reports to A/B/C and renders every seed for the locked comparison.
+latent_reporting:
+  enabled: true
+  split: val
+  random_seed: 0
+  stages: [C]
+  plot_seed_zero_after_phase: 1
+  final_stages: [A, B, C]
+  final_plot_all_seeds: true
+  required_artifacts:
+    - Latent_Report_Config.json
+    - Latent_Snapshot_Metrics.csv
+    - Latent_Per_Class.csv
+    - Latent_Probe_Metrics.csv
+    - Latent_Probe_Per_Class.csv
+
+required_artifacts:
+  - manifest.json
+  - Trials.csv
+  - Overall_Metrics.csv
+  - Per_Dataset_Metrics.csv
+  - Per_Class_Metrics.csv
+  - Confusion_Matrix.csv
+  - Resource_Accounting.csv
+  - Gate_By_Dataset.csv
+  - Expert_Performance_By_Dataset.csv
+  - Expert_Utilization.csv
+  - Representation_Batch_Coverage.csv

@@ -12,6 +12,7 @@ if __name__ == "__main__":
 
 import torch
 
+from evaluation.latent_space import evaluate_latent_checkpoints, plot_latent_snapshots
 from evaluation.out_of_core_report import evaluate_and_report_ooc
 
 from .checkpoint import (
@@ -68,6 +69,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--set", dest="overrides", action="append", default=[])
+    parser.add_argument(
+        "--latent-only",
+        action="store_true",
+        help="load completed checkpoints and regenerate only the configured latent report",
+    )
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
     checkpoint_dir = config["training"]["checkpoint_dir"]
@@ -122,6 +128,14 @@ def main() -> None:
         f"[ooc-run] rows train={len(context.data.train.class_idx):,} "
         f"val={len(context.data.val.class_idx):,} test={len(context.data.test.class_idx):,}"
     )
+
+    if args.latent_only:
+        if not os.path.isfile(resolve_stage_a_path(config)) or not all(
+            stage_complete(checkpoint_dir, stage) for stage in ("B", "C")
+        ):
+            raise RuntimeError("--latent-only requires completed Stage A, B, and C checkpoints")
+        _run_latent_evaluation(config, context)
+        return
 
     stages = config["training"].get("stages", ["A", "B", "C"])
     if config["architecture"] == "no_fusion":
@@ -212,6 +226,25 @@ def main() -> None:
     print("\n=== Overall and per-origin metrics ===")
     print(reports["overall"].to_string(index=False))
     print(f"[ooc-run] detailed reports={config['evaluation']['output_dir']}")
+    _run_latent_evaluation(config, context)
+
+
+def _run_latent_evaluation(config: dict, context) -> None:
+    latent_cfg = config.get("evaluation", {}).get("latent", {})
+    if not latent_cfg.get("enabled", False):
+        return
+    latent_output_dir = os.path.join(config["evaluation"]["output_dir"], "latent")
+    report = evaluate_latent_checkpoints(
+        config, context,
+        split_name=latent_cfg.get("split", "val"),
+        output_dir=latent_output_dir,
+        device=config["training"]["device"],
+        stages=latent_cfg.get("stages", ["C"]),
+    )
+    print(f"[ooc-run] latent report written to {latent_output_dir}")
+    if latent_cfg.get("plot", False):
+        plot_latent_snapshots(report, latent_output_dir, method=latent_cfg.get("plot_method", "umap"))
+        print(f"[ooc-run] latent plots written to {os.path.join(latent_output_dir, 'latent_figures')}")
 
 
 if __name__ == "__main__":

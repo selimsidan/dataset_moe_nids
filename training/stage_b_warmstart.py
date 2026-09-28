@@ -80,6 +80,14 @@ def _build_frozen_encoder(config: dict, data: PreparedData, device: torch.device
     return encoder
 
 
+def _expert_optimizer(params, config: dict) -> torch.optim.Optimizer:
+    return torch.optim.Adam(
+        params,
+        lr=config["training"]["lr"],
+        weight_decay=config["training"].get("weight_decay", 0.0),
+    )
+
+
 def run_stage_b(config: dict, data: PreparedData):
     device = torch.device(config["training"].get("device", "cpu"))
     torch.manual_seed(config.get("seed", 0))
@@ -167,7 +175,7 @@ def run_stage_b(config: dict, data: PreparedData):
         loader = DataLoader(dataset, batch_sampler=_RemappedBatchSampler(sampler, row_indices))
 
         params = expert_train_params(expert_bank, i)
-        optimizer = torch.optim.Adam(params, lr=config["training"]["lr"])
+        optimizer = _expert_optimizer(params, config)
         expert_start_epoch = 0
         if i == resume_dataset_i and resume_optimizer_state is not None:
             optimizer.load_state_dict(resume_optimizer_state)

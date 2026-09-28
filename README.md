@@ -149,16 +149,25 @@ and reproducible PCA/UMAP views for Stage A, every private Stage-B encoder,
 and the Stage-C gate/expert encoders. The default `ce`/`legacy` training
 configuration remains backwards-compatible with earlier runs.
 
-### Finalized greedy MoE study (notebooks 18–24)
+### Bounded-regularization greedy MoE study (notebooks 18–24)
 
-The paper-facing follow-up is defined immutably in
-[`config/greedy_moe_study.yaml`](config/greedy_moe_study.yaml) and executed by
-`training.ablation_matrix`.  It reproduces Run C on paired model/split seeds,
-performs a clean expert-head capacity sweep through `[256, 128]`, compares
-shared full heads with private encoders and rank-16 FiLM adapters, and then
-evaluates CE, SupCon, and balanced SupCon.  Winners are selected exclusively
-from Stage-C validation macro-F1; the test reports written for every run are
-never inputs to the decision logic.
+The current paper-facing follow-up is defined immutably in
+[`config/greedy_moe_study_v2.yaml`](config/greedy_moe_study_v2.yaml) and
+executed by `training.ablation_matrix`. The original 26-run v1 protocol remains
+available in [`config/greedy_moe_study.yaml`](config/greedy_moe_study.yaml), so
+existing v1 checkpoints and summaries are never mixed with the revised study.
+
+V2 reproduces the zero-decay linear control on paired model/split seeds, then
+screens the six nonlinear expert-head capacities at `weight_decay` 0 and
+`1e-4`, plus a linear-head `1e-4` challenger, on seed 0. Only the best challenger
+is confirmed on seeds 1–2 and compared with the three-seed control. The selected
+capacity and decay are held fixed while shared heads, private encoders, and
+rank-16 FiLM adapters are compared, and while CE, SupCon, and balanced SupCon
+are evaluated. This is a 33-run bounded comparison protocol, not final-model
+HPO. Learning rate, broader decay values, dropout, batch size, schedules, gate
+settings, and adapter rank remain deferred until the winning architecture is
+known. Winners are selected exclusively from Stage-C validation macro-F1; test
+reports are never inputs to the decision logic.
 
 Run the notebooks in order:
 
@@ -178,21 +187,28 @@ writes `${PREFIX}_summary/study_state.json` atomically.  Later phases refuse to
 run until their prerequisite winner exists, and a changed study/default config
 requires a new prefix rather than silently mixing protocols.
 
-The CLI equivalent is:
+The v2 CLI equivalent is:
 
 ```bash
-python -m training.ablation_matrix --phase 0 --prefix nfv3_4way_greedy_v1
-python -m training.ablation_matrix --phase 0 --prefix nfv3_4way_greedy_v1 --execute
+python -m training.ablation_matrix --study-config config/greedy_moe_study_v2.yaml --phase 0 --prefix nfv3_4way_greedy_v2
+python -m training.ablation_matrix --study-config config/greedy_moe_study_v2.yaml --phase 0 --prefix nfv3_4way_greedy_v2 --execute
 ```
 
 Every evaluated run must contain its manifest, trial metadata, overall,
 per-dataset, and per-class metrics, confusion matrix, gate/expert reports, and
-resource accounting before the state machine marks it complete.  Stage A also
+resource accounting before the state machine marks it complete. V2 additionally
+requires a validation-split Stage-C latent bundle for every seed/run. The bundle
+contains snapshot geometry, class-level geometry, frozen probe metrics, sampled
+embeddings, and a reproducible sample manifest. Missing latent bundles are
+backfilled from completed checkpoints with `training.ooc_run --latent-only`, so
+no training or full test-set prediction is repeated. Stage A also
 writes `Representation_Batch_Coverage.csv`, which reports per-class batch
 presence, singleton frequency, and the fraction of anchors that had a valid
-same-class contrastive positive.  Phase 4 reuses the already selected three
-runs and writes paired final tables; insurance probes remain deliberately
-deferred.
+same-class contrastive positive. Phase 4 upgrades all three baseline and winner
+runs to A/B/C latent reports with UMAP figures, writes mean/SD latent summaries,
+and writes paired final task tables; insurance probes remain deliberately
+deferred. Latent metrics are explanatory only and never participate in model
+selection.
 
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put

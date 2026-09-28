@@ -9,6 +9,7 @@ results/
 .DS_Store
 .ipynb_checkpoints/
 .env
+.claude/
 *.pem
 *.key
 NIDS_datasets/

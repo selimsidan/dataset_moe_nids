@@ -12,10 +12,12 @@ from data.out_of_core import class_split_quotas, prepare_dataset
 from data.registry import DatasetSpec
 from data.registry import NETFLOW_V3_ALIAS
 from training.config import load_config
+from training.out_of_core_train import _expert_optimizer as _ooc_expert_optimizer
 from training.out_of_core_train import shuffled_row_batches
 from training.out_of_core_data import OutOfCoreContext, prepare_out_of_core_data
 from training.dataset import PreparedData, PreparedSplit
 from training.out_of_core_train import ensure_run_contract, run_stage_a_ooc, run_stage_b_ooc, run_stage_c_ooc
+from training.stage_b_warmstart import _expert_optimizer as _memory_expert_optimizer
 from evaluation.out_of_core_report import evaluate_and_report_ooc
 
 
@@ -59,6 +61,19 @@ def test_bounded_shuffle_uses_every_row_once_and_mixes_blocks():
     rows = np.concatenate(batches)
     assert np.array_equal(np.sort(rows), np.arange(800))
     assert len(np.unique(batches[0] // 100)) > 1
+
+
+@pytest.mark.parametrize("factory", [_memory_expert_optimizer, _ooc_expert_optimizer])
+def test_stage_b_optimizers_honor_weight_decay(factory):
+    import importlib
+
+    module = importlib.import_module(factory.__module__)
+    parameter = module.torch.nn.Parameter(module.torch.tensor(1.0))
+    optimizer = factory(
+        [parameter], {"training": {"lr": 0.001, "weight_decay": 0.0001}}
+    )
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.0001)
 
 
 def test_stage_schedule_and_final_evaluation_are_not_part_of_run_contract(tmp_path):

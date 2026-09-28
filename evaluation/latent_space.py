@@ -1,4 +1,8 @@
-"""Checkpoint-aware latent-space evaluation for the private-encoder MoE.
+"""Checkpoint-aware latent-space evaluation, generalized across every
+architecture used by the greedy MoE study: shared encoder + shared experts
+(``moe_dataset_soft``), shared encoder + per-dataset FiLM adapters
+(``moe_dataset_adapters``), and fully private per-dataset encoders
+(``moe_dataset_private_encoders``).
 
 The report compares the pooled Stage-A encoder, the Stage-B gate/experts, and
 the Stage-C gate/experts on identical stratified rows.  All quantitative
@@ -30,6 +34,8 @@ from sklearn.metrics import (
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import normalize
 
+from models.adapters import AdapterExpertBank
+from models.dataset_experts import DatasetExpertBank
 from models.encoder import SharedEncoder
 from models.private_encoder_experts import PrivateEncoderExpertBank
 from training.checkpoint import (
@@ -39,8 +45,27 @@ from training.checkpoint import (
     load_stage_c,
     resolve_stage_a_path,
 )
-from training.model_utils import build_expert_bank
+from training.model_utils import bank_kind_for_architecture, build_expert_bank
 from training.out_of_core_train import build_ooc_model
+
+_KNOWN_ARCHITECTURES = (
+    "moe_dataset_soft",
+    "moe_dataset_adapters",
+    "moe_dataset_private_encoders",
+)
+
+
+class _EncoderThenAdapter(torch.nn.Module):
+    """Composes a shared encoder with one dataset's FiLM adapter so the
+    adapter-transformed latent can be extracted like any other snapshot."""
+
+    def __init__(self, encoder: torch.nn.Module, adapter: torch.nn.Module) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.adapter = adapter
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.adapter(self.encoder(x))
 
 
 @dataclass(frozen=True)
@@ -78,16 +103,30 @@ def _normalize_stages(stages: Iterable[str] | None) -> tuple[str, ...]:
     return tuple(stage for stage in ("A", "B", "C") if stage in requested)
 
 
-def load_private_encoder_snapshots(
+def load_latent_snapshots(
     config: dict,
     context,
     device: torch.device,
     *,
     stages: Iterable[str] | None = None,
 ) -> list[LatentSnapshot]:
-    """Load only the requested meaningful encoder snapshots."""
-    if config["architecture"] != "moe_dataset_private_encoders":
-        raise ValueError("private latent reporting requires architecture=moe_dataset_private_encoders")
+    """Load the requested meaningful encoder snapshots for whichever of the
+    three greedy-study architectures ``config`` describes.
+
+    - ``moe_dataset_soft``: experts classify directly on the shared latent,
+      so there is no per-dataset representation to snapshot -- only the
+      shared encoder itself (Stage A init, Stage C after joint fine-tuning).
+    - ``moe_dataset_adapters``: each dataset has a FiLM adapter applied to
+      the shared latent; snapshots compose the encoder with each adapter.
+    - ``moe_dataset_private_encoders``: each dataset has a fully independent
+      encoder; snapshots use those encoders directly (unchanged behavior).
+    """
+    architecture = config["architecture"]
+    if architecture not in _KNOWN_ARCHITECTURES:
+        raise ValueError(
+            f"latent reporting does not recognize architecture={architecture!r}; "
+            f"expected one of {_KNOWN_ARCHITECTURES}"
+        )
     stages = _normalize_stages(stages)
     input_dim = context.data.train.features.shape[1]
     snapshots: list[LatentSnapshot] = []
@@ -98,9 +137,10 @@ def load_private_encoder_snapshots(
         snapshots.append(LatentSnapshot("A", "shared_initialization", stage_a, "shared"))
 
     if "B" in stages:
+        bank_kind = bank_kind_for_architecture(architecture)
         stage_b_checkpoint = load_stage_b(config["training"]["checkpoint_dir"])
         bank = build_expert_bank(
-            "private_encoder",
+            bank_kind,
             context.data.active_datasets,
             config["model"]["latent_dim"],
             len(context.data.class_names),
@@ -108,24 +148,42 @@ def load_private_encoder_snapshots(
             input_dim=input_dim,
         ).to(device)
         bank.load_state_dict(stage_b_checkpoint["expert_bank_state"])
-        if not isinstance(bank, PrivateEncoderExpertBank):
-            raise TypeError("expected a PrivateEncoderExpertBank")
         # Stage B never updates the dedicated gate encoder. Keep a metadata-only
         # alias; evaluation reuses the Stage-A embeddings and metric rows.
         snapshots.append(LatentSnapshot(
             "B", "gate", None, "gate", equivalent_to="A__shared_initialization"
         ))
-        for name, expert in zip(context.data.active_datasets, bank.experts):
-            snapshots.append(LatentSnapshot("B", f"expert::{name}", expert.encoder, "private_expert"))
+        if isinstance(bank, PrivateEncoderExpertBank):
+            for name, expert in zip(context.data.active_datasets, bank.experts):
+                snapshots.append(LatentSnapshot("B", f"expert::{name}", expert.encoder, "private_expert"))
+        elif isinstance(bank, AdapterExpertBank):
+            stage_b_encoder = _new_encoder(config, input_dim, device)
+            stage_b_encoder.load_state_dict(
+                torch.load(resolve_stage_a_path(config), map_location="cpu")["encoder_state"]
+            )
+            for name, adapter in zip(context.data.active_datasets, bank.adapters):
+                snapshots.append(LatentSnapshot(
+                    "B", f"expert::{name}",
+                    _EncoderThenAdapter(stage_b_encoder, adapter).to(device),
+                    "adapted_expert",
+                ))
+        elif not isinstance(bank, DatasetExpertBank):
+            raise TypeError(f"unrecognized expert bank type {type(bank)!r}")
 
     if "C" in stages:
         model = build_ooc_model(config, context, device)
         model.load_state_dict(load_stage_c(config["training"]["checkpoint_dir"])["model_state"])
         snapshots.append(LatentSnapshot("C", "gate", model.encoder, "gate"))
-        if not isinstance(model.expert_bank, PrivateEncoderExpertBank):
-            raise TypeError("Stage-C checkpoint does not contain private encoders")
-        for name, expert in zip(context.data.active_datasets, model.expert_bank.experts):
-            snapshots.append(LatentSnapshot("C", f"expert::{name}", expert.encoder, "private_expert"))
+        if isinstance(model.expert_bank, PrivateEncoderExpertBank):
+            for name, expert in zip(context.data.active_datasets, model.expert_bank.experts):
+                snapshots.append(LatentSnapshot("C", f"expert::{name}", expert.encoder, "private_expert"))
+        elif isinstance(model.expert_bank, AdapterExpertBank):
+            for name, adapter in zip(context.data.active_datasets, model.expert_bank.adapters):
+                snapshots.append(LatentSnapshot(
+                    "C", f"expert::{name}", _EncoderThenAdapter(model.encoder, adapter), "adapted_expert"
+                ))
+        elif not isinstance(model.expert_bank, DatasetExpertBank):
+            raise TypeError(f"unrecognized expert bank type {type(model.expert_bank)!r}")
     for snapshot in snapshots:
         if snapshot.module is not None:
             snapshot.module.eval()
@@ -539,7 +597,7 @@ def _aliased_rows(rows, source_id: str, snapshot: LatentSnapshot) -> list[dict]:
     return copied
 
 
-def evaluate_private_latent_checkpoints(
+def evaluate_latent_checkpoints(
     config: dict,
     context,
     *,
@@ -567,7 +625,7 @@ def evaluate_private_latent_checkpoints(
     eval_y = np.asarray(evaluation.class_idx[eval_rows], dtype=np.int64)
     eval_d = np.asarray(evaluation.dataset_idx[eval_rows], dtype=np.int64)
     batch_size = int(latent_cfg.get("batch_size", 4096))
-    snapshots = load_private_encoder_snapshots(config, context, device, stages=stages)
+    snapshots = load_latent_snapshots(config, context, device, stages=stages)
     output_dir = output_dir or config["evaluation"]["output_dir"]
     report_config = {
         "format_version": 2,
@@ -657,6 +715,13 @@ def evaluate_private_latent_checkpoints(
     }
     _write_latent_report(report, output_dir, report_config)
     return report
+
+
+# Backwards-compatible public names used by notebook 17 and external callers.
+# The generalized implementation preserves the private-encoder behavior while
+# also supporting the shared and adapter architectures used by notebooks 18-24.
+load_private_encoder_snapshots = load_latent_snapshots
+evaluate_private_latent_checkpoints = evaluate_latent_checkpoints
 
 
 def combine_latent_reports(

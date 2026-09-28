@@ -301,6 +301,14 @@ def _settings(config: dict):
     )
 
 
+def _expert_optimizer(params, config: dict) -> torch.optim.Optimizer:
+    return torch.optim.Adam(
+        params,
+        lr=config["training"]["lr"],
+        weight_decay=config["training"].get("weight_decay", 0.0),
+    )
+
+
 def _progress_reporter(tag: str, total_rows: int, every_rows: int):
     """Return a cheap row-progress callback for long Colab epochs."""
     started = time.monotonic()
@@ -540,7 +548,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         bounds = data.train.dataset_slices[name]
         local_labels = data.train.class_idx[bounds]
         weights = _loss_weights(local_labels, len(data.class_names), device)
-        optimizer = torch.optim.Adam(expert_train_params(bank, dataset_i), lr=config["training"]["lr"])
+        optimizer = _expert_optimizer(expert_train_params(bank, dataset_i), config)
         first_epoch = resume_epoch if dataset_i == resume_dataset else 0
         if dataset_i == resume_dataset and optimizer_state:
             optimizer.load_state_dict(optimizer_state)
