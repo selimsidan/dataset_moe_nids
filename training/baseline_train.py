@@ -9,13 +9,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.baselines import HardTwoStageModel, NoFusionModel, PlainPooledSoftmax
-from models.encoder import SharedEncoder
+from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 
 from .checkpoint import load_validated_stage_a, stage_a_metadata
 from .dataset import HarmonizedTensorDataset, PreparedData
 from .model_utils import build_matched_dense_model
 from .sampler import ClassBalancedBatchSampler
 from .stage_c_jointfinetune import _set_encoder_trainable
+from .optim import optimizer_hparams
 
 
 def _baseline_config(config: dict) -> dict:
@@ -33,12 +34,9 @@ def _baseline_config(config: dict) -> dict:
 
 def _new_encoder(config: dict, data: PreparedData, device: torch.device) -> SharedEncoder:
     model_cfg = config["model"]
-    return SharedEncoder(
-        input_dim=data.train.features.shape[1],
-        hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"],
-        activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    return build_encoder(
+        data.train.features.shape[1], model_cfg["latent_dim"],
+        resolve_encoder_config(model_cfg),
     ).to(device)
 
 
@@ -76,10 +74,11 @@ def _matched_exposure_warmstart(config: dict, data: PreparedData, model, device:
     for parameter in model.encoder.parameters():
         parameter.requires_grad_(False)
     model.encoder.eval()
+    lr, weight_decay = optimizer_hparams(config, "b")
     optimizer = torch.optim.Adam(
         model.head.parameters(),
-        lr=config["training"]["lr"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+        lr=lr,
+        weight_decay=weight_decay,
     )
     dataset = HarmonizedTensorDataset(data.train)
     steps = examples = 0
@@ -117,10 +116,11 @@ def _matched_exposure_warmstart(config: dict, data: PreparedData, model, device:
 def _train_dense_stage_c(config: dict, data: PreparedData, model, device: torch.device) -> dict:
     started = time.monotonic()
     _set_encoder_trainable(model.encoder, config["training"]["stage_c_unfreeze"])
+    lr, weight_decay = optimizer_hparams(config, "c")
     optimizer = torch.optim.Adam(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=config["training"]["lr"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+        lr=lr,
+        weight_decay=weight_decay,
     )
     sampler = ClassBalancedBatchSampler(
         data.train.class_idx,

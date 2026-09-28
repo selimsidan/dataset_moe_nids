@@ -36,7 +36,7 @@ from evaluation.resource_accounting import resource_profile, stage_a_checkpoint_
 from .baseline_train import train_hard_two_stage, train_matched_dense, train_no_fusion, train_plain_pooled
 from .checkpoint import (
     BASELINE_MODEL_FILE, STAGE_A_FILE, _atomic_torch_save, clear_progress,
-    load_stage_b, load_stage_c,
+    load_configured_stage_b, load_stage_c,
     resolve_stage_a_path, save_harmonizer, split_signature_for_data, stage_complete,
 )
 from .config import load_config
@@ -286,7 +286,7 @@ def main() -> None:
         if stage_metadata.get("training_summary"):
             training_summary["A"] = stage_metadata["training_summary"]
     if architecture in MOE_ARCHITECTURES:
-        stage_b_summary = load_stage_b(config["training"]["checkpoint_dir"]).get("training_summary")
+        stage_b_summary = load_configured_stage_b(config).get("training_summary")
         stage_c_summary = load_stage_c(config["training"]["checkpoint_dir"]).get("training_summary")
         if stage_b_summary:
             training_summary["B"] = stage_b_summary

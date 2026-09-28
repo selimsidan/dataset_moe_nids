@@ -414,6 +414,7 @@ def evaluate_and_report_ooc(
         else {}
     )
     representation_cfg = config.get("training", {}).get("representation", {})
+    representation_by_role = config.get("training", {}).get("representation_by_role", {})
     trials = pd.DataFrame([{
         "Trial_ID": trial_id,
         "run_name": config["run_name"], "architecture": config["architecture"],
@@ -432,6 +433,16 @@ def evaluate_and_report_ooc(
         "representation_weight": representation_cfg.get("weight", 0.1),
         "representation_sampling": representation_cfg.get("sampling", "legacy"),
         "representation_class_weighting": representation_cfg.get("class_weighting", "legacy"),
+        "gate_representation_objective": (
+            representation_by_role.get("gate_encoder", {}).get(
+                "objective", representation_cfg.get("objective", "ce")
+            )
+        ),
+        "private_representation_objective": (
+            representation_by_role.get("private_encoder", {}).get(
+                "objective", representation_cfg.get("objective", "ce")
+            )
+        ),
         "epochs_a": config.get("training", {}).get("epochs_a"),
         "epochs_b": config.get("training", {}).get("epochs_b"),
         "epochs_c_max": config.get("training", {}).get("epochs_c"),
@@ -509,6 +520,7 @@ def evaluate_and_report_ooc(
             "adapter_rank": config.get("model", {}).get("adapter", {}).get("rank"),
             "routing_mode": config.get("model", {}).get("gate", {}).get("routing", "dense"),
             "representation": representation_cfg,
+            "representation_by_role": representation_by_role,
             "epochs_a": config.get("training", {}).get("epochs_a"),
             "epochs_b": config.get("training", {}).get("epochs_b"),
             "epochs_c_max": config.get("training", {}).get("epochs_c"),

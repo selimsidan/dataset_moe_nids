@@ -47,7 +47,7 @@ def _set_dotted(cfg: dict, dotted_key: str, value) -> None:
     parts = dotted_key.split(".")
     node = cfg
     for part in parts[:-1]:
-        node = node[part]
+        node = node.setdefault(part, {})
     node[parts[-1]] = value
 
 

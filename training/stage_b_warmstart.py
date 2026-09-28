@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from models.encoder import SharedEncoder
+from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 
 from .checkpoint import (
     clear_progress, load_progress, load_validated_stage_a, save_progress,
@@ -41,6 +41,7 @@ from .model_utils import (
     initialize_private_expert_encoders,
 )
 from .sampler import ClassBalancedBatchSampler
+from .optim import optimizer_hparams
 
 
 class _RemappedBatchSampler:
@@ -63,15 +64,16 @@ class _RemappedBatchSampler:
             yield self.row_indices[batch].tolist()
 
 
-def _build_frozen_encoder(config: dict, data: PreparedData, device: torch.device) -> SharedEncoder:
-    ckpt = load_validated_stage_a(config, stage_a_metadata(config, data))
+def _build_frozen_encoder(
+    config: dict, data: PreparedData, device: torch.device, role: str = "encoder"
+) -> SharedEncoder:
+    ckpt = load_validated_stage_a(
+        config, stage_a_metadata(config, data, encoder_role=role), role
+    )
     model_cfg = config["model"]
-    encoder = SharedEncoder(
-        input_dim=data.train.features.shape[1],
-        hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"],
-        activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    encoder = build_encoder(
+        data.train.features.shape[1], model_cfg["latent_dim"],
+        resolve_encoder_config(model_cfg, role),
     ).to(device)
     encoder.load_state_dict(ckpt["encoder_state"])
     for p in encoder.parameters():
@@ -81,10 +83,11 @@ def _build_frozen_encoder(config: dict, data: PreparedData, device: torch.device
 
 
 def _expert_optimizer(params, config: dict) -> torch.optim.Optimizer:
+    lr, weight_decay = optimizer_hparams(config, "b")
     return torch.optim.Adam(
         params,
-        lr=config["training"]["lr"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+        lr=lr,
+        weight_decay=weight_decay,
     )
 
 
@@ -130,8 +133,11 @@ def run_stage_b(config: dict, data: PreparedData):
     if warmstart_mode != "dataset":
         raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
 
-    encoder = _build_frozen_encoder(config, data, device)
-    initialize_private_expert_encoders(expert_bank, encoder)
+    primary_role = "gate_encoder" if bank_kind == "private_encoder" else "encoder"
+    encoder = _build_frozen_encoder(config, data, device, primary_role)
+    if bank_kind == "private_encoder":
+        private_source = _build_frozen_encoder(config, data, device, "private_encoder")
+        initialize_private_expert_encoders(expert_bank, private_source)
 
     dataset = HarmonizedTensorDataset(data.train)
     all_class_idx = data.train.class_idx

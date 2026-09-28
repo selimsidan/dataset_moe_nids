@@ -18,7 +18,7 @@ import pandas as pd
 import torch
 
 from data.harmonization import Harmonizer
-from models.encoder import SharedEncoder
+from models.encoder import build_encoder, resolve_encoder_config
 from models.moe import MoEDatasetNIDS
 
 from training.checkpoint import load_harmonizer, load_stage_c
@@ -42,12 +42,10 @@ def load_inference_model(config: dict) -> tuple[MoEDatasetNIDS, Harmonizer, list
     dataset_names = ckpt["dataset_names"]
     model_cfg = config["model"]
 
-    encoder = SharedEncoder(
-        input_dim=harmonizer.output_width,
-        hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"],
-        activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    role = "gate_encoder" if config["architecture"] == "moe_dataset_private_encoders" else "encoder"
+    encoder = build_encoder(
+        harmonizer.output_width, model_cfg["latent_dim"],
+        resolve_encoder_config(model_cfg, role),
     )
     model = build_model(config["architecture"], encoder, dataset_names, class_names, model_cfg)
     model.load_state_dict(ckpt["model_state"])

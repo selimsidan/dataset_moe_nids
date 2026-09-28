@@ -11,7 +11,7 @@ from torch import nn
 from models.adapters import AdapterExpertBank
 from models.baselines import MatchedDenseClassifier, MatchedDenseHead
 from models.dataset_experts import DatasetExpertBank
-from models.encoder import SharedEncoder
+from models.encoder import SharedEncoder, resolve_encoder_config
 from models.gate import Gate
 from models.moe import MoEDatasetNIDS
 from models.private_encoder_experts import PrivateEncoderExpertBank
@@ -210,7 +210,7 @@ def build_expert_bank(
     if bank_kind == "private_encoder":
         if input_dim is None:
             raise ValueError("private_encoder banks require input_dim")
-        encoder_cfg = model_cfg["encoder"]
+        encoder_cfg = resolve_encoder_config(model_cfg, "private_encoder")
         expert_cfg = model_cfg["expert"]
         return PrivateEncoderExpertBank(
             dataset_names=dataset_names,
@@ -222,6 +222,7 @@ def build_expert_bank(
             activation=encoder_cfg["activation"],
             encoder_dropout=encoder_cfg["dropout"],
             expert_dropout=expert_cfg["dropout"],
+            encoder_config=encoder_cfg,
         )
     raise ValueError(
         f"Unknown bank_kind '{bank_kind}'. Expected 'full', 'adapter', or 'private_encoder'."
@@ -278,14 +279,13 @@ def build_model(
 ) -> MoEDatasetNIDS:
     bank_kind = bank_kind_for_architecture(architecture)
     expert_names = expert_names_for_architecture(architecture, dataset_names)
-    first_linear = next(layer for layer in encoder.net if isinstance(layer, nn.Linear))
     bank = build_expert_bank(
         bank_kind,
         expert_names,
         model_cfg["latent_dim"],
         len(class_names),
         model_cfg,
-        input_dim=first_linear.in_features,
+        input_dim=encoder.input_dim,
     )
     gate = Gate(model_cfg["latent_dim"], len(dataset_names), model_cfg["gate"]["hidden_dims"])
     routing_mode = model_cfg.get("gate", {}).get("routing", "dense")

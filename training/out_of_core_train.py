@@ -12,10 +12,18 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from models.encoder import SharedEncoder
+from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 from models.losses import dataset_aux_loss, load_balance_penalty
 from models.moe import MoEDatasetNIDS
-from models.representation_losses import StageARepresentationObjective, representation_config
+from models.representation_losses import (
+    StageARepresentationObjective,
+    representation_config,
+    stage_a_encoder_role,
+)
+from evaluation.validation_report import (
+    write_owned_expert_validation_ooc,
+    write_validation_report_ooc,
+)
 
 from .checkpoint import (
     STAGE_A_FILE,
@@ -23,6 +31,7 @@ from .checkpoint import (
     STAGE_C_FILE,
     clear_progress,
     load_progress,
+    load_configured_stage_b,
     load_validated_stage_a,
     save_progress,
     save_stage_a,
@@ -43,6 +52,7 @@ from .model_utils import (
 from .out_of_core_data import OutOfCoreContext, class_counts
 from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
 from .sampler import class_domain_balanced_row_batches
+from .optim import optimizer_hparams
 
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
@@ -302,10 +312,11 @@ def _settings(config: dict):
 
 
 def _expert_optimizer(params, config: dict) -> torch.optim.Optimizer:
+    lr, weight_decay = optimizer_hparams(config, "b")
     return torch.optim.Adam(
         params,
-        lr=config["training"]["lr"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+        lr=lr,
+        weight_decay=weight_decay,
     )
 
 
@@ -360,19 +371,20 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     device = torch.device(config["training"]["device"])
     torch.manual_seed(config.get("seed", 0))
     model_cfg = config["model"]
-    encoder = SharedEncoder(
-        input_dim=data.train.features.shape[1], hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"], activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    encoder_role = stage_a_encoder_role(config)
+    encoder = build_encoder(
+        data.train.features.shape[1], model_cfg["latent_dim"],
+        resolve_encoder_config(model_cfg, encoder_role),
     ).to(device)
     objective = StageARepresentationObjective(
-        model_cfg["latent_dim"], len(data.class_names), config
+        model_cfg["latent_dim"], len(data.class_names), config, encoder_role
     ).to(device)
+    lr, weight_decay = optimizer_hparams(config, "a")
     optimizer = torch.optim.Adam(
-        [*encoder.parameters(), *objective.parameters()], lr=config["training"]["lr"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+        [*encoder.parameters(), *objective.parameters()], lr=lr,
+        weight_decay=weight_decay,
     )
-    representation = representation_config(config)
+    representation = representation_config(config, encoder_role)
     if representation["class_weighting"] == "legacy":
         weights = _loss_weights(data.train.class_idx, len(data.class_names), device)
     elif representation["class_weighting"] == "none":
@@ -409,7 +421,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         report_progress = _progress_reporter(
             f"Stage A/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
         )
-        sampling = representation_config(config)["sampling"]
+        sampling = representation["sampling"]
         if sampling == "legacy":
             batches = shuffled_row_batches(
                 0, len(data.train.class_idx), rng, batch_size, block_rows, buffer_blocks
@@ -453,6 +465,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         data,
         split_signature=combined_split_signature,
         feature_columns=context.feature_columns,
+        encoder_role=encoder_role,
     )
     metadata["training_summary"] = {
         "optimizer_steps": optimizer_steps,
@@ -474,25 +487,27 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         data.class_names,
         metadata=metadata,
         representation_state=objective.state_dict(),
-        representation_config=representation_config(config),
+        representation_config=representation,
     )
     clear_progress(checkpoint_dir, "A")
     return encoder
 
 
-def _frozen_encoder(config: dict, context: OutOfCoreContext, device) -> SharedEncoder:
+def _frozen_encoder(
+    config: dict, context: OutOfCoreContext, device, role: str = "encoder"
+) -> SharedEncoder:
     data = context.data; model_cfg = config["model"]
-    encoder = SharedEncoder(
-        input_dim=data.train.features.shape[1], hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"], activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    encoder = build_encoder(
+        data.train.features.shape[1], model_cfg["latent_dim"],
+        resolve_encoder_config(model_cfg, role),
     ).to(device)
     encoder.load_state_dict(load_validated_stage_a(
         config,
         stage_a_metadata(
             config, data, split_signature=_hash(context.split_signatures),
-            feature_columns=context.feature_columns,
+            feature_columns=context.feature_columns, encoder_role=role,
         ),
+        role,
     )["encoder_state"])
     encoder.eval()
     for parameter in encoder.parameters():
@@ -528,8 +543,11 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
     if warmstart_mode != "dataset":
         raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
 
-    encoder = _frozen_encoder(config, context, device)
-    initialize_private_expert_encoders(bank, encoder)
+    primary_role = "gate_encoder" if bank_kind == "private_encoder" else "encoder"
+    encoder = _frozen_encoder(config, context, device, primary_role)
+    if bank_kind == "private_encoder":
+        private_source = _frozen_encoder(config, context, device, "private_encoder")
+        initialize_private_expert_encoders(bank, private_source)
     progress = load_progress(checkpoint_dir, "B")
     resume_dataset = 0; resume_epoch = 0; optimizer_state = None
     optimizer_steps = examples_seen = 0
@@ -600,6 +618,10 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
             "selected_epoch": int(config["training"]["epochs_b"]),
         },
     )
+    write_owned_expert_validation_ooc(
+        encoder, bank, context, config,
+        os.path.join(checkpoint_dir, "Validation_Expert_Owned_StageB.csv"),
+    )
     clear_progress(checkpoint_dir, "B")
     return bank
 
@@ -608,7 +630,7 @@ def _set_encoder_trainable(encoder, mode: str):
     for parameter in encoder.parameters():
         parameter.requires_grad_(mode == "all")
     if mode == "last_layer":
-        for parameter in encoder.net[-1].parameters():
+        for parameter in encoder.last_layer_parameters():
             parameter.requires_grad_(True)
     elif mode not in {"all", "none"}:
         raise ValueError(f"Unknown stage_c_unfreeze mode: {mode}")
@@ -616,21 +638,26 @@ def _set_encoder_trainable(encoder, mode: str):
 
 def build_ooc_model(config: dict, context: OutOfCoreContext, device) -> torch.nn.Module:
     data = context.data; model_cfg = config["model"]
-    encoder = SharedEncoder(
-        input_dim=data.train.features.shape[1], hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"], activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    role = "gate_encoder" if config["architecture"] == "moe_dataset_private_encoders" else "encoder"
+    encoder = build_encoder(
+        data.train.features.shape[1], model_cfg["latent_dim"],
+        resolve_encoder_config(model_cfg, role),
     ).to(device)
     encoder.load_state_dict(load_validated_stage_a(
         config,
         stage_a_metadata(
             config, data, split_signature=_hash(context.split_signatures),
-            feature_columns=context.feature_columns,
+            feature_columns=context.feature_columns, encoder_role=role,
         ),
+        role,
     )["encoder_state"])
     model = build_model(config["architecture"], encoder, data.active_datasets, data.class_names, model_cfg).to(device)
-    from .checkpoint import load_stage_b
-    model.expert_bank.load_state_dict(load_stage_b(config["training"]["checkpoint_dir"])["expert_bank_state"])
+    stage_b = load_configured_stage_b(
+        config,
+        expected_dataset_names=list(model.expert_bank.dataset_names),
+        expected_bank_kind=bank_kind_for_architecture(config["architecture"]),
+    )
+    model.expert_bank.load_state_dict(stage_b["expert_bank_state"])
     return model
 
 
@@ -681,9 +708,10 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     stage_b_anchor = _expert_anchor(model)
     for encoder in model_encoder_modules(model):
         _set_encoder_trainable(encoder, config["training"]["stage_c_unfreeze"])
+    lr, weight_decay = optimizer_hparams(config, "c")
     optimizer = torch.optim.Adam(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=config["training"]["lr"], weight_decay=config["training"].get("weight_decay", 0.0),
+        lr=lr, weight_decay=weight_decay,
     )
     weights = _loss_weights(data.train.class_idx, len(data.class_names), device)
     stage_cfg = config["training"]["stage_c"]
@@ -808,6 +836,11 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     save_stage_c(
         checkpoint_dir, model.state_dict(), data.class_names, data.active_datasets,
         bank_kind, training_summary=summary,
+    )
+    write_validation_report_ooc(model, context, config)
+    write_owned_expert_validation_ooc(
+        model.encoder, model.expert_bank, context, config,
+        os.path.join(config["evaluation"]["output_dir"], "Validation_Expert_Owned_StageC.csv"),
     )
     summary_path = os.path.join(checkpoint_dir, STAGE_C_SUMMARY_FILE)
     temporary = summary_path + ".tmp"

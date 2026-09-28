@@ -74,12 +74,27 @@ encoder.
 
 ## 3. The shared encoder
 
-`models/encoder.py::SharedEncoder` — **ported unchanged** from
-`moe_nids/models/encoder.py`. Same role: a plain feed-forward MLP
+`models/encoder.py::SharedEncoder` retains the original feed-forward MLP
 (`input_dim → hidden_dims → latent_dim`, default `hidden_dims=[256,128]`,
-`latent_dim=64`), exactly one instance per run, shared across every dataset
-and every downstream expert/gate computation. `ProbeHead` is a Stage-A-only
-scratch classification head, discarded after Stage A.
+`latent_dim=64`) and its historical state-dict layout. V3 additionally
+supports `kind=residual_mlp`: input projection to `width`, pre-normalized
+residual blocks (`norm → 2× expansion → ReLU → dropout → projection → add`),
+and final norm/ReLU/latent projection. BatchNorm and LayerNorm are selectable.
+
+The ordinary architectures still construct exactly one encoder shared across
+all datasets and expert/gate computations. The private topology may instead
+configure `model.gate_encoder` and `model.private_encoder` independently;
+either key falls back to `model.encoder`, so old configs and checkpoints keep
+their prior behavior. `ProbeHead` remains a Stage-A-only scratch classifier,
+discarded after Stage A.
+
+The fixed notebook-30 workflow opts into role-specific Stage-A initialization.
+`training.stage_a_encoder_role` selects the topology being pretrained, while
+`training.representation_by_role` overlays the historical
+`training.representation` settings for that role. The gate and private
+checkpoints therefore have independently validated topology and objective
+contracts. Configurations that omit these keys retain the historical single
+Stage-A behavior and checkpoint layout.
 
 ## 4. Dataset-experts — architecture and semantics
 
@@ -133,9 +148,11 @@ the one place `architecture` maps onto a concrete bank class.
 `architecture=moe_dataset_private_encoders` replaces shared-latent expert
 heads with complete per-dataset branches: harmonized input → private
 `SharedEncoder` instance → private `Expert` head. A separate encoder supplies
-the dataset-blind gate. Stage A remains pooled; its weights are cloned into
-the gate encoder and every private expert encoder before Stage B. Stage B then
-specializes one entire encoder+head branch per dataset. Dense and top-1
+the dataset-blind gate. Stage A remains pooled. Historically one pooled
+checkpoint initialized both roles; v3 can cache separate pooled gate and
+private topologies, clone the private checkpoint into every branch, and load
+the gate checkpoint independently. Stage B then specializes one entire
+encoder+head branch per dataset. Dense and top-1
 routing retain the same probability-combination and `forward(x)` contracts.
 This is intentionally a representation-capacity ablation rather than a
 capacity-matched method, so resource accounting reports all stored and active

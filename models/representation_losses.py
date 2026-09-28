@@ -125,8 +125,27 @@ class ArcMarginHead(nn.Module):
         return torch.where(one_hot, target_cosine, cosine) * self.scale
 
 
-def representation_config(config: dict) -> dict:
-    values = config.get("training", {}).get("representation", {})
+def stage_a_encoder_role(config: dict) -> str:
+    """Return the encoder role trained by the current Stage-A invocation.
+
+    Historical runs omit this key and continue to train ``model.encoder``.
+    Fixed asymmetric studies can instead create distinct, contract-checked
+    gate/private initialization checkpoints without changing the Stage-A API.
+    """
+    role = str(config.get("training", {}).get("stage_a_encoder_role", "encoder"))
+    if role not in {"encoder", "gate_encoder", "private_encoder"}:
+        raise ValueError(
+            "training.stage_a_encoder_role must be encoder, gate_encoder, or private_encoder"
+        )
+    return role
+
+
+def representation_config(config: dict, encoder_role: str | None = None) -> dict:
+    training = config.get("training", {})
+    values = dict(training.get("representation", {}) or {})
+    role = encoder_role or stage_a_encoder_role(config)
+    role_overrides = (training.get("representation_by_role", {}) or {}).get(role, {}) or {}
+    values.update(role_overrides)
     return {
         "objective": values.get("objective", "ce"),
         "sampling": values.get("sampling", "legacy"),
@@ -144,9 +163,15 @@ class StageARepresentationObjective(nn.Module):
 
     VALID_OBJECTIVES = {"ce", "supcon", "balanced_supcon", "center", "arcface"}
 
-    def __init__(self, latent_dim: int, num_classes: int, config: dict) -> None:
+    def __init__(
+        self,
+        latent_dim: int,
+        num_classes: int,
+        config: dict,
+        encoder_role: str | None = None,
+    ) -> None:
         super().__init__()
-        self.config = representation_config(config)
+        self.config = representation_config(config, encoder_role)
         self.objective = self.config["objective"]
         if self.objective not in self.VALID_OBJECTIVES:
             raise ValueError(

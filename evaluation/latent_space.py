@@ -36,14 +36,14 @@ from sklearn.preprocessing import normalize
 
 from models.adapters import AdapterExpertBank
 from models.dataset_experts import DatasetExpertBank
-from models.encoder import SharedEncoder
+from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 from models.private_encoder_experts import PrivateEncoderExpertBank
 from training.checkpoint import (
-    STAGE_B_FILE,
     STAGE_C_FILE,
-    load_stage_b,
+    load_configured_stage_b,
     load_stage_c,
     resolve_stage_a_path,
+    resolve_stage_b_path,
 )
 from training.model_utils import bank_kind_for_architecture, build_expert_bank
 from training.out_of_core_train import build_ooc_model
@@ -81,14 +81,12 @@ class LatentSnapshot:
         return f"{self.stage}__{self.encoder}"
 
 
-def _new_encoder(config: dict, input_dim: int, device: torch.device) -> SharedEncoder:
+def _new_encoder(
+    config: dict, input_dim: int, device: torch.device, role: str = "encoder"
+) -> SharedEncoder:
     model_cfg = config["model"]
-    return SharedEncoder(
-        input_dim=input_dim,
-        hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"],
-        activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    return build_encoder(
+        input_dim, model_cfg["latent_dim"], resolve_encoder_config(model_cfg, role)
     ).to(device)
 
 
@@ -130,15 +128,34 @@ def load_latent_snapshots(
     stages = _normalize_stages(stages)
     input_dim = context.data.train.features.shape[1]
     snapshots: list[LatentSnapshot] = []
+    gate_role = "gate_encoder" if architecture == "moe_dataset_private_encoders" else "encoder"
     if "A" in stages:
         stage_a_checkpoint = torch.load(resolve_stage_a_path(config), map_location="cpu")
-        stage_a = _new_encoder(config, input_dim, device)
+        stage_a = _new_encoder(config, input_dim, device, gate_role)
         stage_a.load_state_dict(stage_a_checkpoint["encoder_state"])
         snapshots.append(LatentSnapshot("A", "shared_initialization", stage_a, "shared"))
+        include_private = bool(
+            config.get("evaluation", {}).get("latent", {}).get(
+                "include_private_initialization", False
+            )
+        )
+        if architecture == "moe_dataset_private_encoders" and include_private:
+            private_checkpoint = torch.load(
+                resolve_stage_a_path(config, "private_encoder"), map_location="cpu"
+            )
+            private = _new_encoder(config, input_dim, device, "private_encoder")
+            private.load_state_dict(private_checkpoint["encoder_state"])
+            snapshots.append(LatentSnapshot(
+                "A", "private_initialization", private, "private_initialization"
+            ))
 
     if "B" in stages:
         bank_kind = bank_kind_for_architecture(architecture)
-        stage_b_checkpoint = load_stage_b(config["training"]["checkpoint_dir"])
+        stage_b_checkpoint = load_configured_stage_b(
+            config,
+            expected_dataset_names=list(context.data.active_datasets),
+            expected_bank_kind=bank_kind,
+        )
         bank = build_expert_bank(
             bank_kind,
             context.data.active_datasets,
@@ -157,7 +174,7 @@ def load_latent_snapshots(
             for name, expert in zip(context.data.active_datasets, bank.experts):
                 snapshots.append(LatentSnapshot("B", f"expert::{name}", expert.encoder, "private_expert"))
         elif isinstance(bank, AdapterExpertBank):
-            stage_b_encoder = _new_encoder(config, input_dim, device)
+            stage_b_encoder = _new_encoder(config, input_dim, device, gate_role)
             stage_b_encoder.load_state_dict(
                 torch.load(resolve_stage_a_path(config), map_location="cpu")["encoder_state"]
             )
@@ -448,8 +465,15 @@ def _checkpoint_fingerprints(config: dict, stages: tuple[str, ...]) -> dict[str,
     paths = {}
     if "A" in stages or "B" in stages:
         paths["A"] = resolve_stage_a_path(config)
+        if (
+            config.get("architecture") == "moe_dataset_private_encoders"
+            and config.get("evaluation", {}).get("latent", {}).get(
+                "include_private_initialization", False
+            )
+        ):
+            paths["A_private"] = resolve_stage_a_path(config, "private_encoder")
     if "B" in stages:
-        paths["B"] = os.path.join(checkpoint_dir, STAGE_B_FILE)
+        paths["B"] = resolve_stage_b_path(config)
     if "C" in stages:
         paths["C"] = os.path.join(checkpoint_dir, STAGE_C_FILE)
     fingerprints = {}

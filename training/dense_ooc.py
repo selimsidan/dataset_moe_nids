@@ -7,6 +7,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from evaluation.validation_report import write_validation_report_ooc
 
 from models.baselines import PlainPooledSoftmax
 
@@ -32,6 +33,7 @@ from .out_of_core_train import (
     shuffled_row_batches,
 )
 from .stage_c_jointfinetune import _set_encoder_trainable
+from .optim import optimizer_hparams
 
 
 def _expected_stage_a_metadata(config: dict, context: OutOfCoreContext) -> dict:
@@ -60,29 +62,58 @@ def build_dense_ooc(config: dict, context: OutOfCoreContext):
     raise ValueError("dense out-of-core builder supports plain_pooled and matched_dense")
 
 
+def resolve_dense_stage_b_path(config: dict) -> str:
+    source = config.get("training", {}).get("dense_stage_b_checkpoint")
+    if source:
+        return source if source.endswith(".pt") else os.path.join(source, BASELINE_STAGE_B_FILE)
+    return os.path.join(config["training"]["checkpoint_dir"], BASELINE_STAGE_B_FILE)
+
+
 def run_dense_stage_b_ooc(config: dict, context: OutOfCoreContext, model=None):
-    stage_b_path = os.path.join(config["training"]["checkpoint_dir"], BASELINE_STAGE_B_FILE)
+    stage_b_path = resolve_dense_stage_b_path(config)
     if model is None and os.path.isfile(stage_b_path):
         model = build_dense_ooc(config, context)
         checkpoint = torch.load(stage_b_path, map_location="cpu")
+        expected = {
+            "architecture": config["architecture"],
+            "dataset_names": list(context.data.active_datasets),
+        }
+        actual = checkpoint.get("metadata")
+        if actual is not None and actual != expected:
+            raise ValueError(
+                f"Incompatible dense Stage-B checkpoint {stage_b_path}: "
+                f"expected {expected}, actual {actual}"
+            )
         model.load_state_dict(checkpoint["model_state"])
         model.training_summary = {"B": checkpoint["training_summary"]}
         return model
     model = model or build_dense_ooc(config, context)
     curriculum = _baseline_config(config)
     if curriculum["stage_b_warmstart"] == "none":
-        model.training_summary = {"B": {
+        summary = {
             "optimizer_steps": 0, "examples_seen": 0, "epochs_completed": 0,
             "wall_seconds": 0.0, "selected_epoch": 0,
-        }}
+        }
+        model.training_summary = {"B": summary}
+        _atomic_torch_save(
+            {
+                "model_state": model.state_dict(),
+                "training_summary": summary,
+                "metadata": {
+                    "architecture": config["architecture"],
+                    "dataset_names": list(context.data.active_datasets),
+                },
+            },
+            os.path.join(config["training"]["checkpoint_dir"], BASELINE_STAGE_B_FILE),
+        )
         return model
     device = next(model.parameters()).device
     for parameter in model.encoder.parameters():
         parameter.requires_grad_(False)
     model.encoder.eval()
+    lr, weight_decay = optimizer_hparams(config, "b")
     optimizer = torch.optim.Adam(
-        model.head.parameters(), lr=config["training"]["lr"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+        model.head.parameters(), lr=lr, weight_decay=weight_decay,
     )
     progress = load_progress(config["training"]["checkpoint_dir"], "DB")
     resume_dataset = resume_epoch = 0
@@ -127,7 +158,15 @@ def run_dense_stage_b_ooc(config: dict, context: OutOfCoreContext, model=None):
     }
     model.training_summary = {"B": summary}
     _atomic_torch_save(
-        {"model_state": model.state_dict(), "training_summary": summary}, stage_b_path
+        {
+            "model_state": model.state_dict(),
+            "training_summary": summary,
+            "metadata": {
+                "architecture": config["architecture"],
+                "dataset_names": list(context.data.active_datasets),
+            },
+        },
+        os.path.join(config["training"]["checkpoint_dir"], BASELINE_STAGE_B_FILE),
     )
     return model
 
@@ -136,9 +175,10 @@ def run_dense_stage_c_ooc(config: dict, context: OutOfCoreContext, model=None):
     model = model or run_dense_stage_b_ooc(config, context)
     device = next(model.parameters()).device
     _set_encoder_trainable(model.encoder, config["training"]["stage_c_unfreeze"])
+    lr, weight_decay = optimizer_hparams(config, "c")
     optimizer = torch.optim.Adam(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=config["training"]["lr"], weight_decay=config["training"].get("weight_decay", 0.0),
+        lr=lr, weight_decay=weight_decay,
     )
     weights = _loss_weights(context.data.train.class_idx, len(context.data.class_names), device)
     selection = config["training"].get("selection_mode", "fixed_epochs")
@@ -207,6 +247,7 @@ def run_dense_stage_c_ooc(config: dict, context: OutOfCoreContext, model=None):
         "dataset_names": context.data.active_datasets,
         "match_info": getattr(model, "match_info", None), "training_summary": model.training_summary,
     }, os.path.join(config["training"]["checkpoint_dir"], BASELINE_MODEL_FILE))
+    write_validation_report_ooc(model, context, config)
     clear_progress(config["training"]["checkpoint_dir"], "DC")
     return model
 

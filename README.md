@@ -210,6 +210,73 @@ and writes paired final task tables; insurance probes remain deliberately
 deferred. Latent metrics are explanatory only and never participate in model
 selection.
 
+### Targeted multi-depth search v3 (notebooks 25–28)
+
+The adaptive depth study is isolated from v2 in
+[`config/targeted_depth_search_v3.yaml`](config/targeted_depth_search_v3.yaml),
+`training.depth_search`, a `nfv3_4way_depth_v3` prefix, and its own atomic
+state file. It does not modify or reinterpret any notebook 18–24 run.
+
+V3 screens plain and residual shared encoders, expert-head depth, asymmetric
+gate/private encoders, adapter rank, pooled and parameter-matched dense
+controls, router depth, encoder unfreezing, representation losses, and
+Stage-C optimization. Stage-A encoder and Stage-B expert artifacts have
+content-derived cache names, so Stage-C refinements do not retrain them.
+Selection reads only `Validation_*` files, applies dataset/class guardrails,
+and enforces a hard ceiling of 36 evaluated configuration/seed IDs. The final
+phase locks the winner before producing any test report.
+
+Run these notebooks in order; each first prints the complete unblocked A/B/C
+command graph and defaults to one new evaluated run per Colab invocation:
+
+1. [`25_colab_depth_search_phase1.ipynb`](notebooks/25_colab_depth_search_phase1.ipynb)
+2. [`26_colab_depth_search_phase2.ipynb`](notebooks/26_colab_depth_search_phase2.ipynb)
+3. [`27_colab_depth_search_phase3.ipynb`](notebooks/27_colab_depth_search_phase3.ipynb)
+4. [`28_colab_depth_search_phase4.ipynb`](notebooks/28_colab_depth_search_phase4.ipynb)
+
+The equivalent CLI pattern is:
+
+```bash
+# Dry-run the currently unblocked graph.
+python -m training.depth_search --phase 1 --prefix nfv3_4way_depth_v3
+
+# Execute one new evaluated configuration, then rerun safely as needed.
+python -m training.depth_search --phase 1 --prefix nfv3_4way_depth_v3 \
+  --execute --max-new-runs 1
+```
+
+Use phases `1`, `2`, `3`, and `4` in sequence. A protocol/config change after
+the first persisted run requires a new prefix, preventing incompatible cache
+reuse.
+
+### Fixed recommended private-encoder run (notebook 30)
+
+[`30_colab_recommended_private_supcon_3seed.ipynb`](notebooks/30_colab_recommended_private_supcon_3seed.ipynb)
+is an isolated, non-adaptive three-seed run of the selected asymmetric private
+architecture. It does not read or modify the notebook 18–24 greedy-v2 state.
+The gate initialization uses weighted CE, while a separate residual private
+initialization uses balanced SupCon with class/domain-balanced batches. Every
+seed saves validation-selected task metrics, locked test reports, A/B/C latent
+geometry and probes, PCA/UMAP projections, and per-class focus figures.
+
+The notebook always prints the full command graph before execution. The CLI
+equivalent is:
+
+```bash
+python -m training.recommended_private_run \
+  --study-config config/recommended_private_3seed.yaml \
+  --prefix nfv3_4way_recommended_private_bsupcon_v1
+
+python -m training.recommended_private_run \
+  --study-config config/recommended_private_3seed.yaml \
+  --prefix nfv3_4way_recommended_private_bsupcon_v1 \
+  --execute --max-new-seeds 3
+```
+
+The runner is resumable. Use `--max-new-seeds 1` when one Colab session should
+advance only one incomplete seed. Cross-seed task, guardrail, resource, and
+latent summaries are written only after seeds 0, 1, and 2 are complete.
+
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks

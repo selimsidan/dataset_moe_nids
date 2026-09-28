@@ -15,12 +15,17 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from models.encoder import SharedEncoder
-from models.representation_losses import StageARepresentationObjective, representation_config
+from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
+from models.representation_losses import (
+    StageARepresentationObjective,
+    representation_config,
+    stage_a_encoder_role,
+)
 
 from .checkpoint import clear_progress, load_progress, save_progress, save_stage_a, stage_a_metadata
 from .dataset import HarmonizedTensorDataset, PreparedData
 from .sampler import ClassDomainBalancedBatchSampler
+from .optim import optimizer_hparams
 
 
 def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
@@ -30,22 +35,21 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
     input_dim = data.train.features.shape[1]
     num_classes = len(data.class_names)
     model_cfg = config["model"]
+    encoder_role = stage_a_encoder_role(config)
 
-    encoder = SharedEncoder(
-        input_dim=input_dim,
-        hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"],
-        activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    encoder = build_encoder(
+        input_dim, model_cfg["latent_dim"], resolve_encoder_config(model_cfg, encoder_role)
     ).to(device)
     objective = StageARepresentationObjective(
-        model_cfg["latent_dim"], num_classes, config
+        model_cfg["latent_dim"], num_classes, config, encoder_role
     ).to(device)
 
     params = list(encoder.parameters()) + list(objective.parameters())
-    optimizer = torch.optim.Adam(params, lr=config["training"]["lr"], weight_decay=config["training"].get("weight_decay", 0.0))
+    lr, weight_decay = optimizer_hparams(config, "a")
+    optimizer = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
 
-    sampling = representation_config(config)["sampling"]
+    representation = representation_config(config, encoder_role)
+    sampling = representation["sampling"]
     if sampling == "legacy":
         loader = DataLoader(
             HarmonizedTensorDataset(data.train),
@@ -119,7 +123,7 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
                 "examples_seen": examples_seen,
             })
 
-    metadata = stage_a_metadata(config, data)
+    metadata = stage_a_metadata(config, data, encoder_role=encoder_role)
     metadata["training_summary"] = {
         "optimizer_steps": optimizer_steps,
         "examples_seen": examples_seen,
@@ -133,7 +137,7 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
         data.class_names,
         metadata=metadata,
         representation_state=objective.state_dict(),
-        representation_config=representation_config(config),
+        representation_config=representation,
     )
     clear_progress(checkpoint_dir, "A")
     return encoder

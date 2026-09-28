@@ -1,0 +1,109 @@
+# Adaptive targeted-depth study. Existing greedy_moe_study_v2.yaml is immutable.
+format_version: 3
+seeds: [0, 1, 2]
+hard_configuration_ceiling: 36
+
+backbone:
+  architecture: moe_dataset_soft
+  data:
+    active_datasets:
+      - NF-UNSW-NB15-v3
+      - NF-ToN-IoT-v3
+      - NF-BoT-IoT-v3
+      - NF-CICIDS2018-v3
+  model:
+    latent_dim: 64
+    encoder:
+      kind: mlp
+      hidden_dims: [128]
+      activation: relu
+      dropout: 0.2
+    expert:
+      hidden_dims: []
+      dropout: 0.2
+    adapter:
+      rank: 16
+      dropout: 0.2
+    gate:
+      hidden_dims: []
+      routing: dense
+  load_balance:
+    lambda_balance: 0.1
+  training:
+    device: cuda
+    batch_size: 512
+    epochs_a: 30
+    epochs_b: 10
+    epochs_c: 30
+    lr: 0.001
+    weight_decay: 0.0001
+    freeze_encoder_stage_b: true
+    selection_mode: best_val
+    early_stopping_patience: 5
+    stage_c_unfreeze: all
+    run_final_evaluation: false
+    stage_a:
+      optimizer: {lr: 0.001, weight_decay: 0.0001}
+    stage_b:
+      warmstart_mode: dataset
+      optimizer: {lr: 0.001, weight_decay: 0.0001}
+    stage_c:
+      gate_supervision: none
+      expert_update_policy: all
+      lambda_expert_anchor: 0.0
+      optimizer: {lr: 0.001, weight_decay: 0.0001}
+    representation:
+      objective: ce
+      sampling: legacy
+      class_weighting: legacy
+      weight: 0.1
+      temperature: 0.1
+      center_weight: 0.01
+      arc_margin: 0.3
+      arc_scale: 30.0
+
+encoders:
+  shallow:
+    kind: mlp
+    hidden_dims: [128]
+    activation: relu
+    dropout: 0.2
+  plain_deep:
+    kind: mlp
+    hidden_dims: [256, 128]
+    activation: relu
+    dropout: 0.2
+  residual_batchnorm:
+    kind: residual_mlp
+    hidden_dims: []
+    width: 128
+    blocks: 2
+    expansion: 2.0
+    normalization: batchnorm
+    activation: relu
+    dropout: 0.2
+    dropout_second: 0.0
+  residual_layernorm:
+    kind: residual_mlp
+    hidden_dims: []
+    width: 128
+    blocks: 2
+    expansion: 2.0
+    normalization: layernorm
+    activation: relu
+    dropout: 0.2
+    dropout_second: 0.0
+
+selection:
+  near_tie: 0.005
+  expansion_min_gain: 0.003
+  dataset_regression_limit: 0.02
+  rare_recall_regression_limit: 0.05
+  rare_validation_min_support: 20
+  rare_validation_max_support: 200
+  seed0_stop_gap: 0.01
+
+required_validation_artifacts:
+  - Validation_Overall_Metrics.csv
+  - Validation_Per_Dataset_Metrics.csv
+  - Validation_Per_Class_Metrics.csv

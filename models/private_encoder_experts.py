@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from .dataset_experts import Expert
-from .encoder import SharedEncoder
+from .encoder import SharedEncoder, build_encoder
 
 
 class PrivateEncoderExpert(nn.Module):
@@ -32,15 +32,16 @@ class PrivateEncoderExpert(nn.Module):
         activation: str = "relu",
         encoder_dropout: float = 0.1,
         expert_dropout: float = 0.1,
+        encoder_config: dict | None = None,
     ) -> None:
         super().__init__()
-        self.encoder = SharedEncoder(
-            input_dim=input_dim,
-            hidden_dims=encoder_hidden_dims,
-            latent_dim=latent_dim,
-            activation=activation,
-            dropout=encoder_dropout,
-        )
+        resolved_encoder = encoder_config or {
+            "kind": "mlp",
+            "hidden_dims": encoder_hidden_dims,
+            "activation": activation,
+            "dropout": encoder_dropout,
+        }
+        self.encoder = build_encoder(input_dim, latent_dim, resolved_encoder)
         self.head = Expert(
             latent_dim=latent_dim,
             num_classes=num_classes,
@@ -68,6 +69,7 @@ class PrivateEncoderExpertBank(nn.Module):
         activation: str = "relu",
         encoder_dropout: float = 0.1,
         expert_dropout: float = 0.1,
+        encoder_config: dict | None = None,
     ) -> None:
         super().__init__()
         self.dataset_names = list(dataset_names)
@@ -83,6 +85,7 @@ class PrivateEncoderExpertBank(nn.Module):
                     activation=activation,
                     encoder_dropout=encoder_dropout,
                     expert_dropout=expert_dropout,
+                    encoder_config=encoder_config,
                 )
                 for _ in dataset_names
             ]

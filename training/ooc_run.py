@@ -26,8 +26,9 @@ from .checkpoint import (
     HARD_CLASSIFIERS_FILE,
     clear_progress,
     load_stage_c,
-    load_stage_b,
+    load_configured_stage_b,
     resolve_stage_a_path,
+    resolve_stage_b_path,
     stage_complete,
     hard_stage_complete,
 )
@@ -130,8 +131,10 @@ def main() -> None:
     )
 
     if args.latent_only:
-        if not os.path.isfile(resolve_stage_a_path(config)) or not all(
-            stage_complete(checkpoint_dir, stage) for stage in ("B", "C")
+        if (
+            not os.path.isfile(resolve_stage_a_path(config))
+            or not os.path.isfile(resolve_stage_b_path(config))
+            or not stage_complete(checkpoint_dir, "C")
         ):
             raise RuntimeError("--latent-only requires completed Stage A, B, and C checkpoints")
         _run_latent_evaluation(config, context)
@@ -165,10 +168,23 @@ def main() -> None:
                     raise RuntimeError("Dense Stage-A initialization requested but no checkpoint exists")
                 run_stage_a_ooc(config, context)
         if not os.path.isfile(os.path.join(checkpoint_dir, BASELINE_MODEL_FILE)):
+            if "C" not in stages:
+                if "B" in stages:
+                    run_dense_stage_b_ooc(config, context)
+                print("[ooc-run] Dense Stage B complete; Stage C was not requested")
+                return
+            if "B" not in stages and not config["training"].get("dense_stage_b_checkpoint"):
+                raise RuntimeError(
+                    "Dense Stage C requires Stage B in training.stages or "
+                    "training.dense_stage_b_checkpoint"
+                )
             model = run_dense_stage_b_ooc(config, context)
             model = run_dense_stage_c_ooc(config, context, model)
         else:
             model = load_dense_ooc(config, context)
+        if not config["training"].get("run_final_evaluation", True):
+            print("[ooc-run] Dense checkpoints and validation report are ready; test evaluation deferred")
+            return
         reports = evaluate_and_report_ooc(model, context, config, contract)
         print("\n=== Overall and per-origin metrics ===")
         print(reports["overall"].to_string(index=False))
@@ -204,8 +220,10 @@ def main() -> None:
             continue
         function(config, context)
 
-    if not os.path.isfile(resolve_stage_a_path(config)) or not all(
-        stage_complete(checkpoint_dir, stage) for stage in ("B", "C")
+    if (
+        not os.path.isfile(resolve_stage_a_path(config))
+        or not os.path.isfile(resolve_stage_b_path(config))
+        or not stage_complete(checkpoint_dir, "C")
     ):
         print("[ooc-run] Requested stages completed; full evaluation awaits Stage A+B+C checkpoints")
         return
@@ -216,7 +234,7 @@ def main() -> None:
     stage_c_checkpoint = load_stage_c(checkpoint_dir)
     model.load_state_dict(stage_c_checkpoint["model_state"])
     model.training_summary = {}
-    stage_b_summary = load_stage_b(checkpoint_dir).get("training_summary")
+    stage_b_summary = load_configured_stage_b(config).get("training_summary")
     stage_c_summary = stage_c_checkpoint.get("training_summary")
     if stage_b_summary:
         model.training_summary["B"] = stage_b_summary

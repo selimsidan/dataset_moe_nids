@@ -17,6 +17,9 @@ import json
 
 import torch
 
+from models.encoder import resolve_encoder_config
+from models.representation_losses import representation_config
+
 STAGE_A_FILE = "stage_a_encoder.pt"
 STAGE_B_FILE = "stage_b_expert_bank.pt"
 STAGE_C_FILE = "stage_c_full.pt"
@@ -76,28 +79,47 @@ def stage_a_metadata(
     *,
     split_signature: str | None = None,
     feature_columns: list[str] | None = None,
+    encoder_role: str = "encoder",
+    encoder_config: dict | None = None,
 ) -> dict:
-    encoder_cfg = config["model"]["encoder"]
+    encoder_cfg = encoder_config or resolve_encoder_config(config["model"], encoder_role)
     if feature_columns is None:
         harmonizer = getattr(data, "harmonizer", None)
         feature_columns = list(getattr(harmonizer, "output_columns", []))
         if not feature_columns:
             feature_columns = [f"feature_{index}" for index in range(data.train.features.shape[1])]
-    return {
+    encoder_metadata = {
+        "input_dim": int(data.train.features.shape[1]),
+        "hidden_dims": list(encoder_cfg.get("hidden_dims", [])),
+        "latent_dim": int(config["model"]["latent_dim"]),
+        "activation": encoder_cfg.get("activation", "relu"),
+        "dropout": float(encoder_cfg.get("dropout", 0.1)),
+    }
+    if encoder_cfg.get("kind", "mlp") != "mlp":
+        encoder_metadata.update({
+            "kind": encoder_cfg["kind"],
+            "width": int(encoder_cfg.get("width", 128)),
+            "blocks": int(encoder_cfg.get("blocks", 2)),
+            "expansion": float(encoder_cfg.get("expansion", 2.0)),
+            "normalization": encoder_cfg.get("normalization", "layernorm"),
+            "dropout_second": float(encoder_cfg.get("dropout_second", 0.0)),
+        })
+    metadata = {
         "format_version": 2,
         "seed": int(config.get("seed", 0)),
-        "encoder": {
-            "input_dim": int(data.train.features.shape[1]),
-            "hidden_dims": list(encoder_cfg["hidden_dims"]),
-            "latent_dim": int(config["model"]["latent_dim"]),
-            "activation": encoder_cfg["activation"],
-            "dropout": float(encoder_cfg["dropout"]),
-        },
+        "encoder": encoder_metadata,
         "class_names": list(data.class_names),
         "active_datasets": list(data.active_datasets),
         "feature_columns": list(feature_columns),
         "split_signature": split_signature or split_signature_for_data(data),
     }
+    role_aware = (
+        "stage_a_encoder_role" in config.get("training", {})
+        or bool(config.get("training", {}).get("representation_by_role"))
+    )
+    if role_aware:
+        metadata["encoder_role"] = encoder_role
+    return metadata
 
 
 def save_stage_a(
@@ -128,16 +150,25 @@ def load_stage_a(checkpoint_dir: str) -> dict:
     return torch.load(path, map_location="cpu")
 
 
-def resolve_stage_a_path(config: dict) -> str:
+def resolve_stage_a_path(config: dict, encoder_role: str = "encoder") -> str:
     baseline_cfg = config.get("training", {}).get("baseline", {})
-    source = config.get("training", {}).get("stage_a_checkpoint") or baseline_cfg.get("stage_a_checkpoint")
+    training_cfg = config.get("training", {})
+    if encoder_role == "private_encoder":
+        source = training_cfg.get("private_stage_a_checkpoint")
+    else:
+        source = None
+    source = source or training_cfg.get("stage_a_checkpoint") or baseline_cfg.get("stage_a_checkpoint")
     if source:
         return source if source.endswith(".pt") else os.path.join(source, STAGE_A_FILE)
     return os.path.join(config["training"]["checkpoint_dir"], STAGE_A_FILE)
 
 
-def load_validated_stage_a(config: dict, expected_metadata: dict) -> dict:
-    path = resolve_stage_a_path(config)
+def load_validated_stage_a(
+    config: dict,
+    expected_metadata: dict,
+    encoder_role: str = "encoder",
+) -> dict:
+    path = resolve_stage_a_path(config, encoder_role)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"No Stage-A encoder checkpoint at {path}")
     checkpoint = torch.load(path, map_location="cpu")
@@ -153,10 +184,15 @@ def load_validated_stage_a(config: dict, expected_metadata: dict) -> dict:
     }
     if mismatches:
         raise ValueError(f"Incompatible Stage-A checkpoint {path}: {mismatches}")
-    configured_representation = config.get("training", {}).get("representation", {})
+    role_aware = bool(config.get("training", {}).get("representation_by_role"))
+    configured_representation = (
+        representation_config(config, encoder_role)
+        if role_aware
+        else config.get("training", {}).get("representation", {})
+    )
     configured_objective = configured_representation.get("objective", "ce")
     configured_sampling = configured_representation.get("sampling", "legacy")
-    if (configured_objective, configured_sampling) != ("ce", "legacy"):
+    if role_aware or (configured_objective, configured_sampling) != ("ce", "legacy"):
         checkpoint_representation = checkpoint.get("representation_config")
         if checkpoint_representation is None:
             raise ValueError(
@@ -196,10 +232,50 @@ def save_stage_b(
 
 
 def load_stage_b(checkpoint_dir: str) -> dict:
-    path = os.path.join(checkpoint_dir, STAGE_B_FILE)
+    path = checkpoint_dir if checkpoint_dir.endswith(".pt") else os.path.join(checkpoint_dir, STAGE_B_FILE)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"No Stage B checkpoint at {path}. Run Stage B first.")
     return torch.load(path, map_location="cpu")
+
+
+def resolve_stage_b_path(config: dict) -> str:
+    source = config.get("training", {}).get("stage_b_checkpoint")
+    if source:
+        return source if source.endswith(".pt") else os.path.join(source, STAGE_B_FILE)
+    return os.path.join(config["training"]["checkpoint_dir"], STAGE_B_FILE)
+
+
+def load_configured_stage_b(
+    config: dict,
+    *,
+    expected_dataset_names: list[str] | None = None,
+    expected_bank_kind: str | None = None,
+) -> dict:
+    """Load the selected Stage-B artifact and reject obvious cache mix-ups.
+
+    Historical checkpoints remain readable when no expectations are supplied.
+    V3 call sites provide both expectations before attempting to load weights,
+    which produces a useful error instead of a later state-dict shape failure.
+    """
+    checkpoint = load_stage_b(resolve_stage_b_path(config))
+    mismatches = {}
+    if expected_dataset_names is not None:
+        actual = list(checkpoint.get("dataset_names", []))
+        expected = list(expected_dataset_names)
+        if actual != expected:
+            mismatches["dataset_names"] = {"expected": expected, "actual": actual}
+    if expected_bank_kind is not None:
+        actual = checkpoint.get("bank_kind")
+        if actual != expected_bank_kind:
+            mismatches["bank_kind"] = {
+                "expected": expected_bank_kind,
+                "actual": actual,
+            }
+    if mismatches:
+        raise ValueError(
+            f"Incompatible Stage-B checkpoint {resolve_stage_b_path(config)}: {mismatches}"
+        )
+    return checkpoint
 
 
 def save_stage_c(

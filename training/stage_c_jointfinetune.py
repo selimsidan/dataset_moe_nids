@@ -45,17 +45,18 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from models.encoder import SharedEncoder
+from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 from models.losses import dataset_aux_loss, load_balance_penalty
 from models.moe import MoEDatasetNIDS
 
 from .checkpoint import (
-    clear_progress, load_progress, load_validated_stage_a, load_stage_b,
+    clear_progress, load_progress, load_validated_stage_a, load_configured_stage_b,
     save_progress, save_stage_c, stage_a_metadata,
 )
 from .dataset import HarmonizedTensorDataset, PreparedData
 from .model_utils import bank_kind_for_architecture, build_model, model_encoder_modules
 from .sampler import ClassBalancedBatchSampler
+from .optim import optimizer_hparams
 
 
 def _set_encoder_trainable(encoder: SharedEncoder, mode: str) -> None:
@@ -68,8 +69,7 @@ def _set_encoder_trainable(encoder: SharedEncoder, mode: str) -> None:
     elif mode == "last_layer":
         for p in encoder.parameters():
             p.requires_grad_(False)
-        last_linear = encoder.net[-1]
-        for p in last_linear.parameters():
+        for p in encoder.last_layer_parameters():
             p.requires_grad_(True)
     else:
         raise ValueError(f"Unknown stage_c_unfreeze mode: {mode}")
@@ -136,17 +136,23 @@ def build_model_from_checkpoints(config: dict, data: PreparedData, device: torch
     checkpoint_dir = config["training"]["checkpoint_dir"]
     architecture = config["architecture"]
 
-    encoder = SharedEncoder(
-        input_dim=data.train.features.shape[1],
-        hidden_dims=model_cfg["encoder"]["hidden_dims"],
-        latent_dim=model_cfg["latent_dim"],
-        activation=model_cfg["encoder"]["activation"],
-        dropout=model_cfg["encoder"]["dropout"],
+    role = "gate_encoder" if architecture == "moe_dataset_private_encoders" else "encoder"
+    encoder_cfg = resolve_encoder_config(model_cfg, role)
+    encoder = build_encoder(
+        data.train.features.shape[1], model_cfg["latent_dim"], encoder_cfg
     ).to(device)
-    encoder.load_state_dict(load_validated_stage_a(config, stage_a_metadata(config, data))["encoder_state"])
+    encoder.load_state_dict(load_validated_stage_a(
+        config, stage_a_metadata(config, data, encoder_role=role),
+        role,
+    )["encoder_state"])
 
     model = build_model(architecture, encoder, data.active_datasets, data.class_names, model_cfg).to(device)
-    model.expert_bank.load_state_dict(load_stage_b(checkpoint_dir)["expert_bank_state"])
+    stage_b = load_configured_stage_b(
+        config,
+        expected_dataset_names=list(model.expert_bank.dataset_names),
+        expected_bank_kind=bank_kind_for_architecture(config["architecture"]),
+    )
+    model.expert_bank.load_state_dict(stage_b["expert_bank_state"])
     return model
 
 
@@ -174,7 +180,8 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
         raise ValueError("training.stage_c.lambda_expert_anchor must be non-negative")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=config["training"]["lr"], weight_decay=config["training"].get("weight_decay", 0.0))
+    lr, weight_decay = optimizer_hparams(config, "c")
+    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
 
     dataset = HarmonizedTensorDataset(data.train)
     sampler = ClassBalancedBatchSampler(

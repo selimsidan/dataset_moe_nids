@@ -80,6 +80,33 @@ def test_stage_a_snapshot_load_does_not_require_later_checkpoints(tmp_path):
     assert [snapshot.snapshot_id for snapshot in snapshots] == ["A__shared_initialization"]
 
 
+def test_private_stage_a_initialization_is_opt_in(tmp_path):
+    config, context = _fixture(tmp_path)
+    checkpoint_dir = tmp_path / "checkpoints"
+    gate = SharedEncoder(2, [], 2, "relu", 0.0)
+    private = SharedEncoder(2, [3], 2, "relu", 0.0)
+    torch.save({"encoder_state": gate.state_dict()}, checkpoint_dir / "stage_a_encoder.pt")
+    private_dir = tmp_path / "private_a"
+    private_dir.mkdir()
+    torch.save({"encoder_state": private.state_dict()}, private_dir / "stage_a_encoder.pt")
+    config["model"]["gate_encoder"] = {
+        "hidden_dims": [], "activation": "relu", "dropout": 0.0,
+    }
+    config["model"]["private_encoder"] = {
+        "hidden_dims": [3], "activation": "relu", "dropout": 0.0,
+    }
+    config["training"]["private_stage_a_checkpoint"] = str(private_dir)
+    config["evaluation"]["latent"]["include_private_initialization"] = True
+
+    snapshots = load_latent_snapshots(
+        config, context, torch.device("cpu"), stages=["A"]
+    )
+
+    assert [snapshot.snapshot_id for snapshot in snapshots] == [
+        "A__shared_initialization", "A__private_initialization"
+    ]
+
+
 def test_private_latent_public_names_remain_backwards_compatible():
     assert latent.load_private_encoder_snapshots is latent.load_latent_snapshots
     assert latent.evaluate_private_latent_checkpoints is latent.evaluate_latent_checkpoints

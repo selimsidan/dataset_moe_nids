@@ -1,0 +1,108 @@
+# Fixed three-seed performance run. This is intentionally independent from
+# greedy_moe_study_v2.yaml and targeted_depth_search_v3.yaml.
+format_version: 1
+seeds: [0, 1, 2]
+expected_input_features: 47
+expected_classes: 22
+expected_total_parameters: 629212
+
+selection:
+  primary_metric: macro_f1
+  rare_validation_min_support: 20
+  rare_validation_max_support: 200
+
+backbone:
+  architecture: moe_dataset_private_encoders
+  data:
+    active_datasets:
+      - NF-UNSW-NB15-v3
+      - NF-ToN-IoT-v3
+      - NF-BoT-IoT-v3
+      - NF-CICIDS2018-v3
+  model:
+    latent_dim: 64
+    encoder:
+      kind: mlp
+      hidden_dims: [128]
+      activation: relu
+      dropout: 0.2
+    gate_encoder:
+      kind: mlp
+      hidden_dims: [128]
+      activation: relu
+      dropout: 0.2
+    private_encoder:
+      kind: residual_mlp
+      hidden_dims: []
+      width: 128
+      blocks: 2
+      expansion: 2.0
+      normalization: layernorm
+      activation: relu
+      dropout: 0.2
+      dropout_second: 0.0
+    expert:
+      hidden_dims: [64]
+      dropout: 0.2
+    gate:
+      hidden_dims: [64]
+      routing: dense
+  load_balance:
+    lambda_balance: 0.01
+  training:
+    device: cuda
+    batch_size: 512
+    min_per_class_per_batch: 4
+    epochs_a: 30
+    epochs_b: 15
+    epochs_c: 30
+    lr: 0.001
+    weight_decay: 0.0001
+    selection_mode: best_val
+    early_stopping_patience: 5
+    stage_c_unfreeze: all
+    run_final_evaluation: false
+    representation:
+      objective: ce
+      sampling: legacy
+      class_weighting: legacy
+      weight: 0.1
+      temperature: 0.1
+      center_weight: 0.01
+      arc_margin: 0.3
+      arc_scale: 30.0
+    representation_by_role:
+      gate_encoder:
+        objective: ce
+        sampling: legacy
+        class_weighting: legacy
+      private_encoder:
+        objective: balanced_supcon
+        sampling: class_domain_balanced
+        class_weighting: none
+        weight: 0.1
+        temperature: 0.1
+    stage_a:
+      optimizer: {lr: 0.001, weight_decay: 0.0001}
+    stage_b:
+      warmstart_mode: dataset
+      optimizer: {lr: 0.001, weight_decay: 0.0001}
+    stage_c:
+      gate_supervision: light_aux
+      lambda_dataset_aux: 0.1
+      expert_update_policy: all
+      lambda_expert_anchor: 0.0
+      optimizer: {lr: 0.0003, weight_decay: 0.0001}
+  evaluation:
+    latent:
+      enabled: false
+      include_private_initialization: true
+      split: val
+      stages: [A, B, C]
+      max_train_rows: 20000
+      max_eval_rows: 5000
+      max_silhouette_rows: 5000
+      max_per_class_dataset: 250
+      batch_size: 4096
+      knn_neighbors: 5
+      random_seed: 0
