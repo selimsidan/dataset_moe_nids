@@ -290,6 +290,29 @@ advance only one incomplete seed. Cross-seed task, guardrail, resource,
 training-history, and latent summaries are written only after seeds 0, 1, and
 2 are complete.
 
+### Compact soft-MoE confirmation run (notebook 31)
+
+[`31_colab_compact_soft_moe_3seed.ipynb`](notebooks/31_colab_compact_soft_moe_3seed.ipynb)
+reproduces the historical `nfv3_4way_moe_soft_comparable_seed0_v1` contract
+without a hyperparameter search. It locks the shared `47 -> 128 -> 64`
+encoder, four linear `64 -> 22` experts, linear dense gate, `30/10/30`
+Stage-A/B/C schedule, task-only gate supervision, and `0.1` load balancing.
+Seeds 0, 1, and 2 control model initialization, split assignment, shuffling,
+latent sampling, and deterministic CUDA execution. The runner adds the current
+ROC/PR-AUC, resource, expert, training-history, and A/B/C latent reports while
+preserving the original 20,380-parameter model and optimization settings.
+
+```bash
+python -m training.compact_soft_moe_run \
+  --study-config config/compact_soft_moe_3seed.yaml \
+  --prefix nfv3_4way_moe_soft_comparable_repro_v1
+
+python -m training.compact_soft_moe_run \
+  --study-config config/compact_soft_moe_3seed.yaml \
+  --prefix nfv3_4way_moe_soft_comparable_repro_v1 \
+  --execute --max-new-seeds 3
+```
+
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks

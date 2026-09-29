@@ -35,6 +35,7 @@ from .checkpoint import (
 from .config import load_config
 from .logging_utils import tee_stdout_to_file
 from .out_of_core_data import prepare_out_of_core_data
+from .reproducibility import configure_reproducibility
 from .hard_two_stage_ooc import (
     load_hard_two_stage_ooc,
     run_hard_phase_a_ooc,
@@ -79,6 +80,11 @@ def main() -> None:
     )
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
+    if "deterministic" in config.get("training", {}):
+        configure_reproducibility(
+            config.get("seed", 0),
+            deterministic=bool(config["training"]["deterministic"]),
+        )
     checkpoint_dir = config["training"]["checkpoint_dir"]
     tee_stdout_to_file(os.path.join(checkpoint_dir, "train.log"))
     print("\n" + "=" * 80, flush=True)
@@ -114,6 +120,12 @@ def main() -> None:
         _restart(checkpoint_dir)
 
     print(f"[ooc-run] python={sys.executable} architecture={config['architecture']}", flush=True)
+    print(
+        f"[ooc-run] seed={config.get('seed', 0)} "
+        f"split_seed={config['data'].get('split_seed', config.get('seed', 0))} "
+        f"deterministic={bool(config['training'].get('deterministic', False))}",
+        flush=True,
+    )
     print(f"[ooc-run] datasets={config['data']['active_datasets']}", flush=True)
     print(f"[ooc-run] checkpoint_dir={checkpoint_dir}", flush=True)
     print(

@@ -311,6 +311,9 @@ class RecommendedPrivateStudy:
         print(f"[{label}] {shlex.join(command)}", flush=True)
         if self.execute:
             child_env = os.environ.copy(); child_env["PYTHONUNBUFFERED"] = "1"
+            if nested.get("training", {}).get("deterministic", False):
+                child_env["PYTHONHASHSEED"] = str(nested["seed"])
+                child_env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             subprocess.run(command, check=True, env=child_env)
             print(f"[{label}] completed seed={nested['seed']}", flush=True)
 
