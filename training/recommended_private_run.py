@@ -24,6 +24,13 @@ import pandas as pd
 import yaml
 
 from .config import load_config
+from .training_history import (
+    HISTORY_COLUMNS,
+    load_or_reconstruct_history,
+    plot_cross_seed_training_history,
+    plot_seed_training_history,
+    summarize_training_history,
+)
 
 
 STAGE_A_FILE = "stage_a_encoder.pt"
@@ -48,6 +55,11 @@ LATENT_REPORT_FILES = (
     "Latent_Train_Sample_Manifest.csv",
     "Latent_Embeddings.npz",
     "Latent_Train_Embeddings.npz",
+)
+TRAINING_REPORT_FILES = (
+    "Training_History.csv",
+    "Training_Log_Manifest.csv",
+    "Training_Report_Config.json",
 )
 
 
@@ -240,6 +252,7 @@ class RecommendedPrivateStudy:
         nested["seed"] = seed
         nested.setdefault("data", {})["split_seed"] = seed
         nested.setdefault("evaluation", {}).setdefault("latent", {})["random_seed"] = seed
+        nested.setdefault("training", {})["save_epoch_history"] = True
         return nested
 
     def _config(self, nested: dict) -> dict:
@@ -289,9 +302,17 @@ class RecommendedPrivateStudy:
 
     def _run(self, label: str, nested: dict) -> None:
         command = self._command(nested)
+        resolved = self._config(nested)
+        print(
+            f"[{label}] starting seed={nested['seed']} "
+            f"train_log={os.path.join(resolved['training']['checkpoint_dir'], 'train.log')}",
+            flush=True,
+        )
         print(f"[{label}] {shlex.join(command)}", flush=True)
         if self.execute:
-            subprocess.run(command, check=True, env=os.environ.copy())
+            child_env = os.environ.copy(); child_env["PYTHONUNBUFFERED"] = "1"
+            subprocess.run(command, check=True, env=child_env)
+            print(f"[{label}] completed seed={nested['seed']}", flush=True)
 
     def _result_dir(self, seed: int) -> str:
         return self._final_config(seed)["evaluation"]["output_dir"]
@@ -299,6 +320,20 @@ class RecommendedPrivateStudy:
     def _test_complete(self, seed: int) -> bool:
         directory = self._result_dir(seed)
         return all(os.path.isfile(os.path.join(directory, name)) for name in REQUIRED_TEST_REPORTS)
+
+    def _training_dir(self, seed: int) -> str:
+        return os.path.join(self._result_dir(seed), "training")
+
+    def _training_complete(self, seed: int) -> bool:
+        directory = self._training_dir(seed)
+        if not all(os.path.isfile(os.path.join(directory, name)) for name in TRAINING_REPORT_FILES):
+            return False
+        try:
+            with open(os.path.join(directory, "Training_Report_Config.json")) as handle:
+                figures = json.load(handle).get("figure_files", [])
+        except (OSError, ValueError):
+            return False
+        return all(os.path.isfile(path) for path in figures)
 
     def _latent_dir(self, seed: int, stage: str) -> str:
         return os.path.join(self._result_dir(seed), "latent", f"stage_{stage}")
@@ -436,8 +471,115 @@ class RecommendedPrivateStudy:
             for class_name in sorted(set(cumulative["manifest"]["class"].astype(str))):
                 plot_class_focus(cumulative, umap_projection, class_name, cumulative_dir)
 
+    def _materialize_training_report(self, seed: int) -> None:
+        if not self.execute:
+            print(
+                f"[training-report] seed {seed}: combine epoch history, logs, and curves",
+                flush=True,
+            )
+            return
+        final = self._final_config(seed)
+        training_dir = self._training_dir(seed)
+        os.makedirs(training_dir, exist_ok=True)
+        sources = []
+        for role in ("gate_encoder", "private_encoder"):
+            nested = self._stage_a_nested(seed, role)
+            config = self._config(nested)
+            sources.append({
+                "stage": "A", "encoder_role": role,
+                "checkpoint_dir": config["training"]["checkpoint_dir"],
+                "learning_rate": config["training"]["stage_a"]["optimizer"]["lr"],
+            })
+        stage_b = self._config(self._stage_b_nested(seed))
+        sources.append({
+            "stage": "B", "encoder_role": "private_expert",
+            "checkpoint_dir": stage_b["training"]["checkpoint_dir"],
+            "learning_rate": stage_b["training"]["stage_b"]["optimizer"]["lr"],
+        })
+        sources.append({
+            "stage": "C", "encoder_role": "full_model",
+            "checkpoint_dir": final["training"]["checkpoint_dir"],
+            "learning_rate": final["training"]["stage_c"]["optimizer"]["lr"],
+        })
+
+        histories = []
+        log_rows = []
+        for source in sources:
+            log_path = os.path.join(source["checkpoint_dir"], "train.log")
+            history = load_or_reconstruct_history(
+                source["checkpoint_dir"], seed=seed, stage=source["stage"],
+                encoder_role=source["encoder_role"],
+                learning_rate=float(source["learning_rate"]),
+            )
+            if not history.empty:
+                histories.append(history)
+            log_rows.append({
+                "seed": seed, "stage": source["stage"],
+                "encoder_role": source["encoder_role"],
+                "checkpoint_dir": source["checkpoint_dir"], "log_path": log_path,
+                "log_exists": os.path.isfile(log_path),
+                "log_size_bytes": os.path.getsize(log_path) if os.path.isfile(log_path) else 0,
+                "structured_history_exists": os.path.isfile(os.path.join(
+                    source["checkpoint_dir"], "Training_History.csv"
+                )),
+                "history_rows": int(len(history)),
+            })
+        history = (
+            pd.concat(histories, ignore_index=True)
+            if histories else pd.DataFrame(columns=HISTORY_COLUMNS)
+        )
+        stage_c = history[history["stage"] == "C"] if not history.empty else history
+        if not stage_c.empty:
+            missing_total = (history["stage"] == "C") & history["train_total_loss"].isna()
+            stage_cfg = final["training"]["stage_c"]
+            history.loc[missing_total, "train_total_loss"] = (
+                history.loc[missing_total, "train_ce_loss"]
+                + float(final["load_balance"]["lambda_balance"])
+                * history.loc[missing_total, "train_balance_penalty"]
+                + float(stage_cfg.get("lambda_dataset_aux", 0.0))
+                * history.loc[missing_total, "train_dataset_aux_loss"]
+                + float(stage_cfg.get("lambda_expert_anchor", 0.0))
+                * history.loc[missing_total, "train_anchor_penalty"]
+            )
+        summary_path = os.path.join(
+            final["training"]["checkpoint_dir"], "stage_c_training_summary.json"
+        )
+        selected_epoch = None
+        if os.path.isfile(summary_path):
+            with open(summary_path) as handle:
+                selected_epoch = json.load(handle).get("best_epoch")
+        _atomic_csv(history, os.path.join(training_dir, "Training_History.csv"))
+        log_manifest = pd.DataFrame(log_rows)
+        _atomic_csv(log_manifest, os.path.join(training_dir, "Training_Log_Manifest.csv"))
+        figure_dir = os.path.join(training_dir, "training_figures")
+        figures = plot_seed_training_history(
+            history, figure_dir, selected_epoch=selected_epoch
+        )
+        present_stages = sorted(set(history["stage"].astype(str))) if not history.empty else []
+        report = {
+            "format_version": 1,
+            "seed": seed,
+            "selected_stage_c_epoch": selected_epoch,
+            "present_stages": present_stages,
+            "missing_stages": [stage for stage in ("A", "B", "C") if stage not in present_stages],
+            "history_sources": sorted(set(history["history_source"].astype(str))) if not history.empty else [],
+            "figure_files": figures,
+            "log_manifest": os.path.join(training_dir, "Training_Log_Manifest.csv"),
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        _atomic_json(report, os.path.join(training_dir, "Training_Report_Config.json"))
+        print(
+            f"[training-report] seed {seed}: rows={len(history)} figures={len(figures)} "
+            f"directory={training_dir}",
+            flush=True,
+        )
+
     def _seed_complete(self, seed: int) -> bool:
-        return self._test_complete(seed) and self._latent_seed_complete(seed)
+        return (
+            self._test_complete(seed)
+            and self._latent_seed_complete(seed)
+            and self._training_complete(seed)
+        )
 
     def run_seed(self, seed: int) -> None:
         if self.execute:
@@ -445,13 +587,13 @@ class RecommendedPrivateStudy:
         for role in ("gate_encoder", "private_encoder"):
             nested = self._stage_a_nested(seed, role)
             path = self._stage_a_path(seed, role)
-            if os.path.isfile(path):
+            if self.execute and os.path.isfile(path):
                 print(f"[stage-a:{role}] seed {seed}: complete; skipping", flush=True)
             else:
                 self._run(f"stage-a:{role}", nested)
         self._materialize_latent(seed, "A")
 
-        if os.path.isfile(self._stage_b_path(seed)):
+        if self.execute and os.path.isfile(self._stage_b_path(seed)):
             print(f"[stage-b] seed {seed}: complete; skipping", flush=True)
         else:
             self._run("stage-b", self._stage_b_nested(seed))
@@ -459,18 +601,21 @@ class RecommendedPrivateStudy:
 
         final = self._final_config(seed)
         stage_c_path = os.path.join(final["training"]["checkpoint_dir"], STAGE_C_FILE)
-        if os.path.isfile(stage_c_path):
+        if self.execute and os.path.isfile(stage_c_path):
             print(f"[stage-c] seed {seed}: complete; skipping", flush=True)
         else:
             self._run("stage-c", self._final_nested(seed, evaluate=False))
         self._materialize_latent(seed, "C")
 
-        if self._test_complete(seed):
+        if self.execute and self._test_complete(seed):
             print(f"[locked-test] seed {seed}: complete; skipping", flush=True)
         else:
             self._run("locked-test", self._final_nested(seed, evaluate=True))
+        self._materialize_training_report(seed)
         if self.execute and not self._seed_complete(seed):
-            raise RuntimeError(f"seed {seed} did not produce all required task/latent artifacts")
+            raise RuntimeError(
+                f"seed {seed} did not produce all required task, latent, and training artifacts"
+            )
         if self.execute:
             self.state["seeds"][str(seed)] = {
                 "status": "complete",
@@ -487,6 +632,7 @@ class RecommendedPrivateStudy:
         overall_all = []; dataset_all = []; class_all = []; resource_all = []
         validation_rows = []; latent_snapshots = []; latent_classes = []
         latent_probes = []; latent_probe_classes = []
+        training_histories = []; training_logs = []
         for seed in seeds:
             result = self._result_dir(seed)
             overall = pd.read_csv(os.path.join(result, "Overall_Metrics.csv"))
@@ -532,6 +678,11 @@ class RecommendedPrivateStudy:
             ):
                 frame = pd.read_csv(os.path.join(latent_dir, filename)); frame["seed"] = seed
                 target.append(frame)
+            training_dir = self._training_dir(seed)
+            training_history = pd.read_csv(os.path.join(training_dir, "Training_History.csv"))
+            training_history["seed"] = seed; training_histories.append(training_history)
+            training_log = pd.read_csv(os.path.join(training_dir, "Training_Log_Manifest.csv"))
+            training_log["seed"] = seed; training_logs.append(training_log)
 
         frames = {
             "overall": pd.concat(overall_all, ignore_index=True),
@@ -543,7 +694,10 @@ class RecommendedPrivateStudy:
             "latent_class": pd.concat(latent_classes, ignore_index=True),
             "probe": pd.concat(latent_probes, ignore_index=True),
             "probe_class": pd.concat(latent_probe_classes, ignore_index=True),
+            "training": pd.concat(training_histories, ignore_index=True),
+            "training_logs": pd.concat(training_logs, ignore_index=True),
         }
+        training_summary = summarize_training_history(frames["training"])
         outputs = {
             "Three_Seed_Overall.csv": frames["overall"],
             "Three_Seed_Overall_Summary.csv": _mean_sd(frames["overall"], []),
@@ -568,6 +722,9 @@ class RecommendedPrivateStudy:
             "Latent_Probe_Summary_3Seed.csv": _mean_sd(frames["probe"], ["snapshot", "stage", "encoder", "probe", "target"]),
             "Latent_Probe_Per_Class_3Seed.csv": frames["probe_class"],
             "Latent_Probe_Per_Class_Summary_3Seed.csv": _mean_sd(frames["probe_class"], ["snapshot", "stage", "encoder", "probe", "class"]),
+            "Training_History_3Seed.csv": frames["training"],
+            "Training_History_Summary_3Seed.csv": training_summary,
+            "Training_Log_Manifest_3Seed.csv": frames["training_logs"],
         }
         for filename, frame in outputs.items():
             _atomic_csv(frame, os.path.join(self.summary_dir, filename))
@@ -578,6 +735,9 @@ class RecommendedPrivateStudy:
             "per_class_all": frames["latent_class"],
         }
         figures = _save_summary_plots(self.summary_dir, plot_inputs)
+        training_figures = plot_cross_seed_training_history(
+            training_summary, os.path.join(self.summary_dir, "training_figures")
+        )
         manifest = {
             "format_version": 1,
             "protocol_hash": self.protocol_hash,
@@ -587,6 +747,10 @@ class RecommendedPrivateStudy:
             "result_dirs": {str(seed): self._result_dir(seed) for seed in seeds},
             "summary_files": sorted(outputs),
             "figure_files": figures,
+            "training_figure_files": training_figures,
+            "notebook_stream_log": os.path.join(
+                self.summary_dir, "Notebook_Training_Stream.log"
+            ),
             "completed_utc": datetime.now(timezone.utc).isoformat(),
         }
         _atomic_json(manifest, os.path.join(self.summary_dir, "Final_Study_Manifest.json"))
@@ -595,8 +759,14 @@ class RecommendedPrivateStudy:
         self._save_state()
 
     def run(self) -> None:
+        print(
+            f"[runner] mode={'EXECUTE' if self.execute else 'DRY_RUN'} prefix={self.prefix} "
+            f"seeds={self.study['seeds']} summary_dir={self.summary_dir}",
+            flush=True,
+        )
         launched = 0
         for seed in self.study["seeds"]:
+            print(f"[runner] seed {seed}: checking resumable artifacts", flush=True)
             incomplete = not self._seed_complete(seed)
             if self.execute and not incomplete:
                 print(f"[runner] seed {seed}: all task and latent artifacts complete", flush=True)

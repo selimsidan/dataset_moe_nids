@@ -99,11 +99,13 @@ def test_stage_schedule_and_final_evaluation_are_not_part_of_run_contract(tmp_pa
     stage_b_config = copy.deepcopy(config)
     stage_b_config["training"]["stages"] = ["B"]
     stage_b_config["training"]["run_final_evaluation"] = True
+    stage_b_config["training"]["save_epoch_history"] = True
     stage_b_contract = ensure_run_contract(stage_b_config, context)
 
     assert stage_a_contract == stage_b_contract
     assert "stages" not in stage_a_contract["training"]
     assert "run_final_evaluation" not in stage_a_contract["training"]
+    assert "save_epoch_history" not in stage_a_contract["training"]
 
 
 @pytest.mark.parametrize("architecture", ["moe_dataset_soft", "moe_dataset_private_encoders"])
@@ -145,6 +147,7 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
                 "expert_update_policy": "assigned_only", "lambda_expert_anchor": 0.0001,
             },
             "checkpoint_dir": str(tmp_path / "checkpoints"), "stages": ["A", "B", "C"],
+            "save_epoch_history": True,
             "shuffle_block_rows": 16, "shuffle_buffer_blocks": 2,
         },
         "evaluation": {"output_dir": str(tmp_path / "results"), "prediction_chunk_rows": 8},
@@ -180,6 +183,9 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
     assert manifest["trial_id"] == "synthetic-seed0"
     assert manifest["resolved_experiment"]["expert_hidden_dims"] == [8]
     assert "Representation_Batch_Coverage.csv" in manifest["report_files"]
+    history = pd.read_csv(tmp_path / "checkpoints" / "Training_History.csv")
+    assert set(history["stage"]) == {"A", "B", "C"}
+    assert not history.duplicated(["seed", "stage", "encoder_role", "dataset", "epoch"]).any()
 
 
 def test_two_way_configuration_builds_logical_pooled_views(tmp_path, monkeypatch):

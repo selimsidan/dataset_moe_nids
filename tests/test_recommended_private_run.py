@@ -155,6 +155,7 @@ def test_fixed_runner_builds_separate_role_checkpoints_and_three_seeds(tmp_path)
     private = runner._stage_a_nested(0, "private_encoder")
     assert gate["training"]["stage_a_encoder_role"] == "gate_encoder"
     assert private["training"]["stage_a_encoder_role"] == "private_encoder"
+    assert gate["training"]["save_epoch_history"] is True
     assert runner._stage_a_path(0, "gate_encoder") != runner._stage_a_path(0, "private_encoder")
     stage_b = runner._stage_b_nested(0)
     assert stage_b["training"]["stage_a_checkpoint"] == runner._stage_a_path(0, "gate_encoder")
@@ -195,6 +196,68 @@ def test_flatten_overrides_and_mean_sd_are_deterministic():
     assert round(summary.iloc[0]["macro_f1__std"], 8) == 0.1
 
 
+def test_seed_training_report_reconstructs_logs_and_saves_all_curves(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    runner.execute = True
+    directories = {
+        name: tmp_path / name for name in ("gate", "private", "stage_b", "final")
+    }
+    for directory in directories.values():
+        directory.mkdir()
+    common_training = {
+        "stage_a": {"optimizer": {"lr": 0.001}},
+        "stage_b": {"optimizer": {"lr": 0.001}},
+        "stage_c": {
+            "optimizer": {"lr": 0.0003}, "lambda_dataset_aux": 0.1,
+            "lambda_expert_anchor": 0.0,
+        },
+    }
+
+    def config(directory):
+        return {
+            "training": {**copy.deepcopy(common_training), "checkpoint_dir": str(directory)},
+            "load_balance": {"lambda_balance": 0.01},
+        }
+
+    gate = config(directories["gate"]); private = config(directories["private"])
+    stage_b = config(directories["stage_b"]); final = config(directories["final"])
+    (directories["gate"] / "train.log").write_text(
+        "[Stage A/ooc] epoch 1: objective=ce CE=0.9 metric=0.0 total=0.9 rows=100\n"
+    )
+    (directories["private"] / "train.log").write_text(
+        "[Stage A/ooc] epoch 1: objective=balanced_supcon CE=0.8 metric=0.4 total=0.84 rows=100\n"
+    )
+    (directories["stage_b"] / "train.log").write_text(
+        "[Stage B/ooc:A] epoch 1: CE=0.7 rows=50\n"
+    )
+    (directories["final"] / "train.log").write_text(
+        "[Stage C/ooc] epoch 1: CE=0.6 balance=0.1 aux=0.2 anchor=0.0 "
+        "policy=all gate_supervision=light_aux rows=100\n"
+        "[Stage C/ooc] epoch 1: val_macro_f1=0.65 best=0.65 patience_left=5\n"
+    )
+    (directories["final"] / "stage_c_training_summary.json").write_text(
+        json.dumps({"best_epoch": 1})
+    )
+    monkeypatch.setattr(
+        runner, "_stage_a_nested", lambda seed, role: gate if role == "gate_encoder" else private
+    )
+    monkeypatch.setattr(runner, "_stage_b_nested", lambda seed: stage_b)
+    monkeypatch.setattr(runner, "_final_config", lambda seed: final)
+    monkeypatch.setattr(runner, "_config", lambda nested: nested)
+    monkeypatch.setattr(runner, "_training_dir", lambda seed: str(tmp_path / "report"))
+
+    runner._materialize_training_report(0)
+
+    report_dir = tmp_path / "report"
+    history = pd.read_csv(report_dir / "Training_History.csv")
+    report = json.loads((report_dir / "Training_Report_Config.json").read_text())
+    assert set(history["stage"]) == {"A", "B", "C"}
+    assert report["history_sources"] == ["legacy_log"]
+    assert len(report["figure_files"]) == 3
+    assert all(Path(path).is_file() for path in report["figure_files"])
+    assert (report_dir / "Training_Log_Manifest.csv").is_file()
+
+
 def test_notebook_30_is_valid_and_targets_only_fixed_runner():
     path = Path("notebooks/30_colab_recommended_private_supcon_3seed.ipynb")
     notebook = json.loads(path.read_text())
@@ -204,6 +267,9 @@ def test_notebook_30_is_valid_and_targets_only_fixed_runner():
     assert "config/recommended_private_3seed.yaml" in source
     assert "MAX_NEW_SEEDS = 3" in source
     assert "EXECUTE = False" in source
+    assert "run_streaming_logged" in source
+    assert "Notebook_Training_Stream.log" in source
+    assert "Training_History_Summary_3Seed.csv" in source
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] == "code":
             compile("".join(cell["source"]), f"notebook30:cell{index}", "exec")

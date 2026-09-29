@@ -53,6 +53,7 @@ from .out_of_core_data import OutOfCoreContext, class_counts
 from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
 from .sampler import class_domain_balanced_row_batches
 from .optim import optimizer_hparams
+from .training_history import append_training_history
 
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
@@ -63,6 +64,7 @@ ORCHESTRATION_TRAINING_KEYS = {
     "force_restart",
     "progress_every_rows",
     "run_final_evaluation",
+    "save_epoch_history",
     "stages",
 }
 
@@ -415,6 +417,7 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for epoch in range(start_epoch, int(config["training"]["epochs_a"])):
+        epoch_started = time.monotonic()
         rng = np.random.default_rng(config.get("seed", 0) + epoch)
         encoder.train(); objective.train()
         totals = {"ce": 0.0, "metric": 0.0, "total": 0.0}; rows_seen = 0
@@ -453,6 +456,16 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             f"CE={totals['ce'] / rows_seen:.6f} metric={totals['metric'] / rows_seen:.6f} "
             f"total={totals['total'] / rows_seen:.6f} rows={rows_seen:,}"
         )
+        append_training_history(config, {
+            "stage": "A", "encoder_role": encoder_role, "dataset": "ALL",
+            "epoch": epoch + 1, "objective": objective.objective,
+            "learning_rate": optimizer.param_groups[0]["lr"], "rows": rows_seen,
+            "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
+            "epoch_seconds": time.monotonic() - epoch_started,
+            "train_ce_loss": totals["ce"] / rows_seen,
+            "train_representation_loss": totals["metric"] / rows_seen,
+            "train_total_loss": totals["total"] / rows_seen,
+        })
         save_progress(checkpoint_dir, "A", {
             "epoch": epoch + 1, "encoder_state": encoder.state_dict(),
             "objective_state": objective.state_dict(), "optimizer_state": optimizer.state_dict(),
@@ -571,6 +584,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         if dataset_i == resume_dataset and optimizer_state:
             optimizer.load_state_dict(optimizer_state)
         for epoch in range(first_epoch, int(config["training"]["epochs_b"])):
+            epoch_started = time.monotonic()
             rng = np.random.default_rng(config.get("seed", 0) + dataset_i * 10_000 + epoch)
             loss_sum = 0.0; rows_seen = 0
             total_rows = bounds.stop - bounds.start
@@ -594,6 +608,16 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
                 report_progress(rows_seen)
             report_progress(rows_seen, force=True)
             print(f"[Stage B/ooc:{name}] epoch {epoch + 1}: CE={loss_sum / rows_seen:.6f} rows={rows_seen:,}")
+            append_training_history(config, {
+                "stage": "B",
+                "encoder_role": "private_expert" if bank_kind == "private_encoder" else "expert",
+                "dataset": name, "epoch": epoch + 1, "objective": "ce",
+                "learning_rate": optimizer.param_groups[0]["lr"], "rows": rows_seen,
+                "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
+                "epoch_seconds": time.monotonic() - epoch_started,
+                "train_ce_loss": loss_sum / rows_seen,
+                "train_total_loss": loss_sum / rows_seen,
+            })
             save_progress(checkpoint_dir, "B", {
                 "dataset_i": dataset_i, "epoch": epoch + 1,
                 "expert_bank_state": bank.state_dict(), "optimizer_state": optimizer.state_dict(),
@@ -752,6 +776,7 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     completed_epoch = start_epoch
     for epoch in range(start_epoch, int(config["training"]["epochs_c"])):
+        epoch_started = time.monotonic()
         completed_epoch = epoch + 1
         rng = np.random.default_rng(config.get("seed", 0) + 100_000 + epoch)
         totals = {"ce": 0.0, "balance": 0.0, "aux": 0.0, "anchor": 0.0}; rows_seen = 0
@@ -796,6 +821,8 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
             f"anchor={totals['anchor']/rows_seen:.6f} policy={expert_update_policy} "
             f"gate_supervision={supervision} rows={rows_seen:,}"
         )
+        val_macro_f1 = np.nan
+        improved: bool | float = np.nan
         if selection_mode == "best_val":
             val_macro_f1 = _validation_macro_f1(
                 model, data.val, len(data.class_names), device,
@@ -813,6 +840,28 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
                 f"[Stage C/ooc] epoch {epoch + 1}: val_macro_f1={val_macro_f1:.6f} "
                 f"best={best_val_macro_f1:.6f} patience_left={patience_left}"
             )
+        average = {name: value / rows_seen for name, value in totals.items()}
+        append_training_history(config, {
+            "stage": "C", "encoder_role": "full_model", "dataset": "ALL",
+            "epoch": epoch + 1, "objective": "joint",
+            "learning_rate": optimizer.param_groups[0]["lr"], "rows": rows_seen,
+            "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
+            "epoch_seconds": time.monotonic() - epoch_started,
+            "train_ce_loss": average["ce"],
+            "train_balance_penalty": average["balance"],
+            "train_dataset_aux_loss": average["aux"],
+            "train_anchor_penalty": average["anchor"],
+            "train_total_loss": (
+                average["ce"] + balance_lambda * average["balance"]
+                + aux_lambda * average["aux"] + anchor_lambda * average["anchor"]
+            ),
+            "val_macro_f1": val_macro_f1,
+            "best_val_macro_f1": (
+                best_val_macro_f1 if selection_mode == "best_val" else np.nan
+            ),
+            "improved": improved,
+            "patience_left": patience_left if selection_mode == "best_val" else np.nan,
+        })
         save_progress(checkpoint_dir, "C", {
             "epoch": epoch + 1, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
             "best_val_macro_f1": best_val_macro_f1, "best_model_state": best_model_state,

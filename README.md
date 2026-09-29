@@ -259,8 +259,20 @@ initialization uses balanced SupCon with class/domain-balanced batches. Every
 seed saves validation-selected task metrics, locked test reports, A/B/C latent
 geometry and probes, PCA/UMAP projections, and per-class focus figures.
 
-The notebook always prints the full command graph before execution. The CLI
-equivalent is:
+The notebook always prints the full command graph before execution. Its
+training cell then streams merged stdout/stderr line by line, emits a
+30-second heartbeat during quiet work, and persists the identical stream as
+`Notebook_Training_Stream.log`. Each child process also retains its own
+checkpoint-local `train.log`.
+
+With epoch history enabled by this fixed runner, every seed writes atomic,
+resume-safe Stage-A/B/C loss and validation histories plus learning-curve
+PNGs under its result directory's `training/` folder. Completed historical
+runs without structured history are reconstructed from `train.log` where
+possible. The three-seed summary adds mean/SD histories and cross-seed curves.
+This observability option is excluded from the scientific run contract and
+does not change optimization or checkpoint compatibility. The CLI equivalent
+is:
 
 ```bash
 python -m training.recommended_private_run \
@@ -274,8 +286,9 @@ python -m training.recommended_private_run \
 ```
 
 The runner is resumable. Use `--max-new-seeds 1` when one Colab session should
-advance only one incomplete seed. Cross-seed task, guardrail, resource, and
-latent summaries are written only after seeds 0, 1, and 2 are complete.
+advance only one incomplete seed. Cross-seed task, guardrail, resource,
+training-history, and latent summaries are written only after seeds 0, 1, and
+2 are complete.
 
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put

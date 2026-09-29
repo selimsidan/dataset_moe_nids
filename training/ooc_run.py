@@ -51,6 +51,7 @@ from .out_of_core_train import (
     run_stage_b_ooc,
     run_stage_c_ooc,
 )
+from .training_history import TRAINING_HISTORY_FILE
 
 
 def _restart(checkpoint_dir: str) -> None:
@@ -60,6 +61,7 @@ def _restart(checkpoint_dir: str) -> None:
         STAGE_A_FILE, STAGE_B_FILE, STAGE_C_FILE, BASELINE_MODEL_FILE, BASELINE_STAGE_B_FILE,
         HARD_ROUTER_FILE, HARD_CLASSIFIERS_FILE,
         HARMONIZER_FILE, CONTRACT_FILE, STAGE_C_SUMMARY_FILE,
+        TRAINING_HISTORY_FILE,
     ):
         path = os.path.join(checkpoint_dir, filename)
         if os.path.isfile(path):

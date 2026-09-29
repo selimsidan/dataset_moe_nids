@@ -490,6 +490,13 @@ hyperparameters — is driven by `config/default.yaml`, loaded via
 `training/config.py` with dotted `--set key.path=value` CLI overrides,
 identical mechanism to `moe_nids`.
 
+Long-running Notebook-30 runs opt into `training.save_epoch_history`. This is
+an orchestration-only setting: it atomically records completed-epoch losses,
+validation macro-F1, and resume counters without entering the scientific run
+contract or changing any gradients. Notebook output is independently streamed
+to a persistent aggregate log with heartbeats, while each training subprocess
+keeps its checkpoint-local `train.log`.
+
 ## 13. Summary of what's different from `moe_nids`
 
 | | `moe_nids` | `dataset_moe_nids` |
