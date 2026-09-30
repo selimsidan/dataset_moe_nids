@@ -313,6 +313,24 @@ python -m training.compact_soft_moe_run \
   --execute --max-new-seeds 3
 ```
 
+Four follow-up notebooks isolate one compact-model question at a time while
+retaining Notebook 31's paired seeds, splits, reports, and resumability:
+
+- [`31c.ipynb`](notebooks/31c.ipynb) compares Stage-C learning rates `1e-3`
+  and `3e-4`, reusing identical Stage-A/B artifacts.
+- [`31depth.ipynb`](notebooks/31depth.ipynb) runs the complete
+  encoder-depth × expert-depth 2×2 factorial.
+- [`31_pooledB.ipynb`](notebooks/31_pooledB.ipynb) adds deterministic,
+  class-balanced 10% pooled replay during Stage B while retaining the
+  20,380-parameter deployed topology.
+- [`31_class_conditional_routing.ipynb`](notebooks/31_class_conditional_routing.ipynb)
+  adds a zero-initialized 4×22 reliability matrix to the sample-level gate
+  and retrains only Stage C from the baseline Stage-A/B artifacts.
+
+Each notebook completes the Notebook 31 baseline first if needed, defaults to
+a dry run, gives every condition a separate immutable prefix, and displays
+paired validation deltas before descriptive locked-test comparisons.
+
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put
 the token directly in a notebook cell or clone URL. The numbered notebooks

@@ -47,7 +47,7 @@ from torch.utils.data import DataLoader
 
 from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 from models.losses import dataset_aux_loss, load_balance_penalty
-from models.moe import MoEDatasetNIDS
+from models.moe import ClassConditionalMoEDatasetNIDS, MoEDatasetNIDS
 
 from .checkpoint import (
     clear_progress, load_progress, load_validated_stage_a, load_configured_stage_b,
@@ -178,6 +178,9 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
     lambda_expert_anchor = float(stage_c_cfg.get("lambda_expert_anchor", 0.0))
     if lambda_expert_anchor < 0:
         raise ValueError("training.stage_c.lambda_expert_anchor must be non-negative")
+    lambda_reliability = float(stage_c_cfg.get("lambda_reliability", 0.0))
+    if lambda_reliability < 0:
+        raise ValueError("training.stage_c.lambda_reliability must be non-negative")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     lr, weight_decay = optimizer_hparams(config, "c")
@@ -220,7 +223,10 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
     completed_epoch = start_epoch
     for epoch in range(start_epoch, config["training"]["epochs_c"]):
         completed_epoch = epoch + 1
-        totals = {"ce": 0.0, "balance": 0.0, "dataset_aux": 0.0, "anchor": 0.0}
+        totals = {
+            "ce": 0.0, "balance": 0.0, "dataset_aux": 0.0,
+            "anchor": 0.0, "reliability": 0.0,
+        }
         n_batches = 0
         for features, class_idx, dataset_idx in loader:
             features, class_idx, dataset_idx = features.to(device), class_idx.to(device), dataset_idx.to(device)
@@ -228,7 +234,15 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
             out = model(features)  # dense runs all experts; top1 dispatches one per row
             task_gate_weights = _gate_weights_for_task(out["gate_weights"], gate_supervision)
             ownership_ids = dataset_idx if expert_update_policy == "assigned_only" else None
-            if model.routing_mode == "top1":
+            if isinstance(model, ClassConditionalMoEDatasetNIDS):
+                class_gate_weights = model.class_gate_weights(task_gate_weights)
+                training_probs = model.combine_class_conditional_probs_for_training(
+                    class_gate_weights,
+                    out["expert_probs"],
+                    ownership_ids,
+                    expert_update_policy,
+                )
+            elif model.routing_mode == "top1":
                 training_probs = MoEDatasetNIDS.combine_top1_for_training(
                     task_gate_weights,
                     out["selected_probs"],
@@ -247,6 +261,12 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
             loss = ce + lambda_balance * balance
             anchor = _expert_anchor_penalty(model, stage_b_anchor) if lambda_expert_anchor > 0 else ce.new_zeros(())
             loss = loss + lambda_expert_anchor * anchor
+            reliability = (
+                model.class_reliability.square().mean()
+                if isinstance(model, ClassConditionalMoEDatasetNIDS)
+                else ce.new_zeros(())
+            )
+            loss = loss + lambda_reliability * reliability
             aux_value = 0.0
             if lambda_dataset_aux > 0.0:
                 aux = dataset_aux_loss(out["gate_weights"], dataset_idx)
@@ -263,11 +283,13 @@ def run_stage_c(config: dict, data: PreparedData) -> MoEDatasetNIDS:
             totals["balance"] += balance.item()
             totals["dataset_aux"] += aux_value
             totals["anchor"] += anchor.item()
+            totals["reliability"] += reliability.item()
             n_batches += 1
         print(
             f"[Stage C] epoch {epoch}: "
             f"CE={totals['ce'] / n_batches:.4f} balance={totals['balance'] / n_batches:.4f} "
             f"dataset_aux={totals['dataset_aux'] / n_batches:.4f} anchor={totals['anchor'] / n_batches:.6f} "
+            f"reliability={totals['reliability'] / n_batches:.6f} "
             f"policy={expert_update_policy} gate_supervision={gate_supervision} "
             f"(dataset_aux_lambda={lambda_dataset_aux}, anchor_lambda={lambda_expert_anchor})"
         )

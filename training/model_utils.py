@@ -13,7 +13,7 @@ from models.baselines import MatchedDenseClassifier, MatchedDenseHead
 from models.dataset_experts import DatasetExpertBank
 from models.encoder import SharedEncoder, resolve_encoder_config
 from models.gate import Gate
-from models.moe import MoEDatasetNIDS
+from models.moe import ClassConditionalMoEDatasetNIDS, MoEDatasetNIDS
 from models.private_encoder_experts import PrivateEncoderExpertBank
 
 ADAPTER_ARCHITECTURES = {"moe_dataset_adapters"}
@@ -22,6 +22,7 @@ PRIVATE_ENCODER_ARCHITECTURES = {"moe_dataset_private_encoders"}
 DATASET_MOE_ARCHITECTURES = {
     "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
     "moe_dataset_adapters", "moe_dataset_private_encoders",
+    "moe_dataset_class_conditional",
 }
 
 
@@ -289,4 +290,9 @@ def build_model(
     )
     gate = Gate(model_cfg["latent_dim"], len(dataset_names), model_cfg["gate"]["hidden_dims"])
     routing_mode = model_cfg.get("gate", {}).get("routing", "dense")
-    return MoEDatasetNIDS(encoder, bank, gate, class_names, routing_mode=routing_mode)
+    model_class = (
+        ClassConditionalMoEDatasetNIDS
+        if architecture == "moe_dataset_class_conditional"
+        else MoEDatasetNIDS
+    )
+    return model_class(encoder, bank, gate, class_names, routing_mode=routing_mode)

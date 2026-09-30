@@ -8,6 +8,7 @@ separate scripts/forks:
     python -m training.run --config config/default.yaml --set architecture=moe_dataset_damex
     python -m training.run --config config/default.yaml --set architecture=moe_dataset_adapters
     python -m training.run --config config/default.yaml --set architecture=moe_dataset_private_encoders
+    python -m training.run --config config/default.yaml --set architecture=moe_dataset_class_conditional
     python -m training.run --config config/default.yaml --set architecture=moe_basic
     python -m training.run --config config/default.yaml --set architecture=plain_pooled
     python -m training.run --config config/default.yaml --set architecture=no_fusion
@@ -49,6 +50,7 @@ from .stage_c_jointfinetune import build_model_from_checkpoints, run_stage_c
 MOE_ARCHITECTURES = (
     "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
     "moe_dataset_adapters", "moe_dataset_private_encoders", "moe_basic",
+    "moe_dataset_class_conditional",
 )
 ALL_ARCHITECTURES = (*MOE_ARCHITECTURES, "matched_dense", "plain_pooled", "no_fusion", "hard_two_stage")
 

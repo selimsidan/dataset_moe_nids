@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from .checkpoint import resolve_stage_a_path, resolve_stage_b_path
+from .config import load_config
+
 from .recommended_private_run import (
     RecommendedPrivateStudy,
     _atomic_csv,
@@ -43,9 +46,33 @@ class CompactSoftMoEStudy(RecommendedPrivateStudy):
 
     def _final_nested(self, seed: int, *, evaluate: bool = True) -> dict:
         nested = self._base_nested(seed, f"{self.prefix}_seed{seed}")
-        nested["training"]["stages"] = ["A", "B", "C"]
+        stages = ["A", "B", "C"]
+        reference_a = self.study.get("reuse_stage_a_from_prefix")
+        reference_b = self.study.get("reuse_stage_b_from_prefix")
+        if reference_b and not reference_a:
+            reference_a = reference_b
+        if reference_a:
+            nested["training"]["stage_a_checkpoint"] = self._reference_checkpoint(
+                str(reference_a), seed, "stage_a_encoder.pt"
+            )
+            stages.remove("A")
+        if reference_b:
+            nested["training"]["stage_b_checkpoint"] = self._reference_checkpoint(
+                str(reference_b), seed, "stage_b_expert_bank.pt"
+            )
+            stages.remove("B")
+        nested["training"]["stages"] = stages
         nested["training"]["run_final_evaluation"] = bool(evaluate)
         return nested
+
+    def _reference_checkpoint(
+        self, reference_prefix: str, seed: int, filename: str
+    ) -> str:
+        base = load_config(self.base_config_path)
+        return os.path.join(
+            base["OUTPUT_DIR"], "checkpoints",
+            f"{reference_prefix}_seed{seed}", filename,
+        )
 
     def _final_config(self, seed: int) -> dict:
         return self._config(self._final_nested(seed))
@@ -62,12 +89,17 @@ class CompactSoftMoEStudy(RecommendedPrivateStudy):
         training_dir = self._training_dir(seed)
         os.makedirs(training_dir, exist_ok=True)
         roles = {"A": "encoder", "B": "expert", "C": "full_model"}
+        stage_dirs = {
+            "A": os.path.dirname(resolve_stage_a_path(config)),
+            "B": os.path.dirname(resolve_stage_b_path(config)),
+            "C": checkpoint_dir,
+        }
         histories = []
         for stage, role in roles.items():
             stage_cfg = config["training"].get(f"stage_{stage.lower()}", {})
             optimizer = stage_cfg.get("optimizer", {}) or {}
             history = load_or_reconstruct_history(
-                checkpoint_dir,
+                stage_dirs[stage],
                 seed=seed,
                 stage=stage,
                 encoder_role=role,

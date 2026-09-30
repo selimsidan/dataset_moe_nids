@@ -17,15 +17,19 @@ HISTORY_COLUMNS = [
     "history_source",
     "learning_rate",
     "rows",
+    "replay_rows",
     "optimizer_steps",
     "examples_seen",
     "epoch_seconds",
     "train_total_loss",
     "train_ce_loss",
+    "train_owned_ce_loss",
+    "train_replay_ce_loss",
     "train_representation_loss",
     "train_balance_penalty",
     "train_dataset_aux_loss",
     "train_anchor_penalty",
+    "train_reliability_penalty",
     "val_macro_f1",
     "best_val_macro_f1",
     "improved",
@@ -94,7 +98,7 @@ _STAGE_A = re.compile(
 )
 _STAGE_B = re.compile(
     rf"\[Stage B/ooc:(?P<dataset>.+?)\] epoch (?P<epoch>\d+): "
-    rf"CE=(?P<ce>{_FLOAT}) rows=(?P<rows>[\d,]+)"
+    rf"CE=(?P<ce>{_FLOAT}).*?(?:owned_)?rows=(?P<rows>[\d,]+)"
 )
 _STAGE_C = re.compile(
     rf"\[Stage C/ooc\] epoch (?P<epoch>\d+): CE=(?P<ce>{_FLOAT}) "
@@ -273,6 +277,7 @@ def plot_seed_training_history(
             ("train_balance_penalty", "balance"),
             ("train_dataset_aux_loss", "dataset auxiliary"),
             ("train_anchor_penalty", "anchor"),
+            ("train_reliability_penalty", "class reliability"),
         ):
             if stage_c[column].notna().any():
                 axes[0].plot(stage_c["epoch"], stage_c[column], marker="o", label=label)

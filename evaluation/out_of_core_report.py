@@ -401,6 +401,23 @@ def evaluate_and_report_ooc(
         }
         for i, name in enumerate(data.active_datasets[:num_experts])
     ])
+    reliability_frame = None
+    if hasattr(model, "class_reliability"):
+        values = model.class_reliability.detach().cpu().numpy()
+        preference = np.exp(values - values.max(axis=0, keepdims=True))
+        preference /= preference.sum(axis=0, keepdims=True)
+        reliability_frame = pd.DataFrame([
+            {
+                "expert": expert_name,
+                "class": class_name,
+                "reliability_logit": float(values[expert_index, class_index]),
+                "reliability_only_expert_preference": float(
+                    preference[expert_index, class_index]
+                ),
+            }
+            for expert_index, expert_name in enumerate(data.active_datasets)
+            for class_index, class_name in enumerate(data.class_names)
+        ])
     confusion_frame = pd.DataFrame(combined, index=data.class_names, columns=data.class_names)
     confusion_frame.index.name = "true_class"
     per_dataset = overall[overall["origin"] != "ALL"].copy()
@@ -487,6 +504,11 @@ def evaluate_and_report_ooc(
         temporary = os.path.join(result_dir, filename + ".tmp")
         frame.to_csv(temporary, index=index)
         os.replace(temporary, os.path.join(result_dir, filename))
+    if reliability_frame is not None:
+        reliability_path = os.path.join(result_dir, "Class_Conditional_Reliability.csv")
+        temporary = reliability_path + ".tmp"
+        reliability_frame.to_csv(temporary, index=False)
+        os.replace(temporary, reliability_path)
     write_resource_accounting(result_dir, [resource_row])
 
     coverage_source = os.path.join(os.path.dirname(stage_path), REPRESENTATION_COVERAGE_FILE)
@@ -504,6 +526,8 @@ def evaluate_and_report_ooc(
     ]
     if os.path.isfile(coverage_report):
         report_files.append(REPRESENTATION_COVERAGE_FILE)
+    if reliability_frame is not None:
+        report_files.append("Class_Conditional_Reliability.csv")
     manifest = {
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "trial_id": trial_id,
@@ -540,4 +564,5 @@ def evaluate_and_report_ooc(
         "overall": overall, "per_class": per_class, "gate": gate,
         "expert_performance": expert_performance,
         "utilization": utilization_frame, "confusion": confusion_frame,
+        "class_conditional_reliability": reliability_frame,
     }

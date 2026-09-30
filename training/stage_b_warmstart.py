@@ -21,6 +21,7 @@ randomly-initialized ones. Number of experts/datasets trained here is
 from __future__ import annotations
 
 import time
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -42,6 +43,11 @@ from .model_utils import (
 )
 from .sampler import ClassBalancedBatchSampler
 from .optim import optimizer_hparams
+from .pooled_replay import (
+    build_stratified_replay_reservoir,
+    draw_class_balanced_replay_rows,
+    replay_rows_for_owned_batch,
+)
 
 
 class _RemappedBatchSampler:
@@ -133,6 +139,10 @@ def run_stage_b(config: dict, data: PreparedData):
     if warmstart_mode != "dataset":
         raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
 
+    stage_b_cfg = config["training"].get("stage_b", {})
+    replay_fraction = float(stage_b_cfg.get("replay_fraction", 0.0))
+    replay_rows_for_owned_batch(1, replay_fraction)
+
     primary_role = "gate_encoder" if bank_kind == "private_encoder" else "encoder"
     encoder = _build_frozen_encoder(config, data, device, primary_role)
     if bank_kind == "private_encoder":
@@ -142,11 +152,22 @@ def run_stage_b(config: dict, data: PreparedData):
     dataset = HarmonizedTensorDataset(data.train)
     all_class_idx = data.train.class_idx
     all_dataset_idx = data.train.dataset_idx
+    replay_pools = {}
+    if replay_fraction > 0:
+        replay_pools = build_stratified_replay_reservoir(
+            all_class_idx,
+            all_dataset_idx,
+            max_per_class_dataset=int(
+                stage_b_cfg.get("replay_pool_per_class_dataset", 4096)
+            ),
+            seed=config.get("seed", 0) + 700_000,
+        )
 
     checkpoint_every = config["training"].get("checkpoint_every_n_epochs", 1)
 
     resume_dataset_i, resume_epoch, resume_optimizer_state = 0, 0, None
     optimizer_steps = examples_seen = 0
+    owned_examples_seen = replay_examples_seen = 0
     started = time.monotonic()
     progress = load_progress(checkpoint_dir, "B")
     if progress is not None:
@@ -156,6 +177,8 @@ def run_stage_b(config: dict, data: PreparedData):
         resume_optimizer_state = progress["optimizer_state"]
         optimizer_steps = int(progress.get("optimizer_steps", 0))
         examples_seen = int(progress.get("examples_seen", 0))
+        owned_examples_seen = int(progress.get("owned_examples_seen", 0))
+        replay_examples_seen = int(progress.get("replay_examples_seen", 0))
         print(f"[Stage B] resuming from dataset[{resume_dataset_i}] epoch {resume_epoch} (found existing progress checkpoint)")
 
     for i, dataset_name in enumerate(active_datasets):
@@ -189,6 +212,7 @@ def run_stage_b(config: dict, data: PreparedData):
 
         for epoch in range(expert_start_epoch, config["training"]["epochs_b"]):
             total_loss, n_batches = 0.0, 0
+            rows_seen = 0
             for features, class_idx, _dataset_idx in loader:
                 features, class_idx = features.to(device), class_idx.to(device)
                 if getattr(expert_bank, "expects_raw_input", False):
@@ -197,13 +221,48 @@ def run_stage_b(config: dict, data: PreparedData):
                     with torch.no_grad():
                         expert_input = encoder(features)
                 logits = expert_forward_one(expert_bank, i, expert_input)
-                loss = F.cross_entropy(logits, class_idx)
+                owned_loss = F.cross_entropy(logits, class_idx)
+                replay_count = replay_rows_for_owned_batch(
+                    len(class_idx), replay_fraction
+                )
+                if replay_count:
+                    replay_rng = np.random.default_rng(
+                        config.get("seed", 0) + i * 10_000_000
+                        + epoch * 100_000 + rows_seen
+                    )
+                    replay_ids = draw_class_balanced_replay_rows(
+                        replay_pools, replay_count, replay_rng
+                    )
+                    replay_features = torch.from_numpy(
+                        data.train.features[replay_ids]
+                    ).to(device)
+                    replay_labels = torch.from_numpy(
+                        data.train.class_idx[replay_ids]
+                    ).to(device)
+                    if getattr(expert_bank, "expects_raw_input", False):
+                        replay_input = replay_features
+                    else:
+                        with torch.no_grad():
+                            replay_input = encoder(replay_features)
+                    replay_loss = F.cross_entropy(
+                        expert_forward_one(expert_bank, i, replay_input),
+                        replay_labels,
+                    )
+                    loss = (
+                        (1.0 - replay_fraction) * owned_loss
+                        + replay_fraction * replay_loss
+                    )
+                else:
+                    loss = owned_loss
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 optimizer_steps += 1
-                examples_seen += len(class_idx)
+                examples_seen += len(class_idx) + replay_count
+                owned_examples_seen += len(class_idx)
+                replay_examples_seen += replay_count
+                rows_seen += len(class_idx)
                 total_loss += loss.item()
                 n_batches += 1
             print(f"[Stage B] expert[{dataset_name}] epoch {epoch}: CE={total_loss / max(1, n_batches):.4f}")
@@ -216,6 +275,8 @@ def run_stage_b(config: dict, data: PreparedData):
                     "optimizer_state": optimizer.state_dict(),
                     "optimizer_steps": optimizer_steps,
                     "examples_seen": examples_seen,
+                    "owned_examples_seen": owned_examples_seen,
+                    "replay_examples_seen": replay_examples_seen,
                 })
 
     save_stage_b(
@@ -229,6 +290,10 @@ def run_stage_b(config: dict, data: PreparedData):
             "epochs_completed": config["training"]["epochs_b"],
             "wall_seconds": time.monotonic() - started,
             "selected_epoch": config["training"]["epochs_b"],
+            "replay_fraction": replay_fraction,
+            "owned_examples_seen": owned_examples_seen,
+            "replay_examples_seen": replay_examples_seen,
+            "replay_pool_rows": sum(len(rows) for rows in replay_pools.values()),
         },
     )
     clear_progress(checkpoint_dir, "B")

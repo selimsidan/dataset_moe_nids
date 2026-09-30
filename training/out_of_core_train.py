@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
 from models.losses import dataset_aux_loss, load_balance_penalty
-from models.moe import MoEDatasetNIDS
+from models.moe import ClassConditionalMoEDatasetNIDS, MoEDatasetNIDS
 from models.representation_losses import (
     StageARepresentationObjective,
     representation_config,
@@ -53,6 +53,11 @@ from .out_of_core_data import OutOfCoreContext, class_counts
 from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
 from .sampler import class_domain_balanced_row_batches
 from .optim import optimizer_hparams
+from .pooled_replay import (
+    build_stratified_replay_reservoir,
+    draw_class_balanced_replay_rows,
+    replay_rows_for_owned_batch,
+)
 from .training_history import append_training_history
 
 CONTRACT_FILE = "run_contract.json"
@@ -556,6 +561,31 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
     if warmstart_mode != "dataset":
         raise ValueError("training.stage_b.warmstart_mode must be 'dataset' or 'random_init'")
 
+    stage_b_cfg = config["training"].get("stage_b", {})
+    replay_fraction = float(stage_b_cfg.get("replay_fraction", 0.0))
+    replay_rows_for_owned_batch(1, replay_fraction)  # validates the fraction
+    replay_pools: dict[int, np.ndarray] = {}
+    pooled_weights = None
+    if replay_fraction > 0:
+        replay_pools = build_stratified_replay_reservoir(
+            data.train.class_idx,
+            data.train.dataset_idx,
+            max_per_class_dataset=int(
+                stage_b_cfg.get("replay_pool_per_class_dataset", 4096)
+            ),
+            seed=config.get("seed", 0) + 700_000,
+            chunk_rows=int(config["training"].get("shuffle_block_rows", 65_536)),
+        )
+        pooled_weights = _loss_weights(
+            data.train.class_idx, len(data.class_names), device
+        )
+        print(
+            f"[Stage B/ooc] pooled replay enabled: fraction={replay_fraction:.3f} "
+            f"reservoir_rows={sum(len(rows) for rows in replay_pools.values()):,} "
+            f"classes={len(replay_pools)}",
+            flush=True,
+        )
+
     primary_role = "gate_encoder" if bank_kind == "private_encoder" else "encoder"
     encoder = _frozen_encoder(config, context, device, primary_role)
     if bank_kind == "private_encoder":
@@ -564,6 +594,7 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
     progress = load_progress(checkpoint_dir, "B")
     resume_dataset = 0; resume_epoch = 0; optimizer_state = None
     optimizer_steps = examples_seen = 0
+    owned_examples_seen = replay_examples_seen = 0
     started = time.monotonic()
     if progress:
         bank.load_state_dict(progress["expert_bank_state"])
@@ -571,6 +602,8 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         optimizer_state = progress.get("optimizer_state")
         optimizer_steps = int(progress.get("optimizer_steps", 0))
         examples_seen = int(progress.get("examples_seen", 0))
+        owned_examples_seen = int(progress.get("owned_examples_seen", 0))
+        replay_examples_seen = int(progress.get("replay_examples_seen", 0))
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     for dataset_i, name in enumerate(data.active_datasets):
@@ -586,7 +619,8 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
         for epoch in range(first_epoch, int(config["training"]["epochs_b"])):
             epoch_started = time.monotonic()
             rng = np.random.default_rng(config.get("seed", 0) + dataset_i * 10_000 + epoch)
-            loss_sum = 0.0; rows_seen = 0
+            loss_sum = owned_loss_sum = replay_loss_sum = 0.0
+            rows_seen = replay_rows_seen = 0
             total_rows = bounds.stop - bounds.start
             report_progress = _progress_reporter(
                 f"Stage B/ooc:{name} epoch {epoch + 1}", total_rows, progress_every
@@ -599,35 +633,87 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
                     with torch.no_grad():
                         expert_input = encoder(features)
                 optimizer.zero_grad(set_to_none=True)
-                loss = F.cross_entropy(
+                owned_loss = F.cross_entropy(
                     expert_forward_one(bank, dataset_i, expert_input), labels, weight=weights
                 )
+                replay_count = replay_rows_for_owned_batch(len(row_ids), replay_fraction)
+                if replay_count:
+                    replay_rng = np.random.default_rng(
+                        config.get("seed", 0) + dataset_i * 10_000_000
+                        + epoch * 100_000 + rows_seen
+                    )
+                    replay_ids = draw_class_balanced_replay_rows(
+                        replay_pools, replay_count, replay_rng
+                    )
+                    replay_features, replay_labels, _ = _batch(
+                        data.train, replay_ids, device
+                    )
+                    if getattr(bank, "expects_raw_input", False):
+                        replay_input = replay_features
+                    else:
+                        with torch.no_grad():
+                            replay_input = encoder(replay_features)
+                    replay_loss = F.cross_entropy(
+                        expert_forward_one(bank, dataset_i, replay_input),
+                        replay_labels,
+                        weight=pooled_weights,
+                    )
+                    loss = (
+                        (1.0 - replay_fraction) * owned_loss
+                        + replay_fraction * replay_loss
+                    )
+                else:
+                    replay_loss = owned_loss.new_zeros(())
+                    loss = owned_loss
                 loss.backward(); optimizer.step()
-                optimizer_steps += 1; examples_seen += len(row_ids)
-                loss_sum += float(loss.item()) * len(row_ids); rows_seen += len(row_ids)
+                optimizer_steps += 1
+                examples_seen += len(row_ids) + replay_count
+                owned_examples_seen += len(row_ids)
+                replay_examples_seen += replay_count
+                loss_sum += float(loss.item()) * len(row_ids)
+                owned_loss_sum += float(owned_loss.item()) * len(row_ids)
+                replay_loss_sum += float(replay_loss.item()) * replay_count
+                rows_seen += len(row_ids)
+                replay_rows_seen += replay_count
                 report_progress(rows_seen)
             report_progress(rows_seen, force=True)
-            print(f"[Stage B/ooc:{name}] epoch {epoch + 1}: CE={loss_sum / rows_seen:.6f} rows={rows_seen:,}")
+            print(
+                f"[Stage B/ooc:{name}] epoch {epoch + 1}: "
+                f"CE={loss_sum / rows_seen:.6f} "
+                f"owned_CE={owned_loss_sum / rows_seen:.6f} "
+                f"replay_CE={replay_loss_sum / max(1, replay_rows_seen):.6f} "
+                f"owned_rows={rows_seen:,} replay_rows={replay_rows_seen:,}"
+            )
             append_training_history(config, {
                 "stage": "B",
                 "encoder_role": "private_expert" if bank_kind == "private_encoder" else "expert",
                 "dataset": name, "epoch": epoch + 1, "objective": "ce",
-                "learning_rate": optimizer.param_groups[0]["lr"], "rows": rows_seen,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "rows": rows_seen + replay_rows_seen,
+                "replay_rows": replay_rows_seen,
                 "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
                 "epoch_seconds": time.monotonic() - epoch_started,
                 "train_ce_loss": loss_sum / rows_seen,
+                "train_owned_ce_loss": owned_loss_sum / rows_seen,
+                "train_replay_ce_loss": (
+                    replay_loss_sum / replay_rows_seen if replay_rows_seen else np.nan
+                ),
                 "train_total_loss": loss_sum / rows_seen,
             })
             save_progress(checkpoint_dir, "B", {
                 "dataset_i": dataset_i, "epoch": epoch + 1,
                 "expert_bank_state": bank.state_dict(), "optimizer_state": optimizer.state_dict(),
                 "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
+                "owned_examples_seen": owned_examples_seen,
+                "replay_examples_seen": replay_examples_seen,
             })
         # Mark this expert complete before moving to the next one.
         save_progress(checkpoint_dir, "B", {
             "dataset_i": dataset_i + 1, "epoch": 0,
             "expert_bank_state": bank.state_dict(), "optimizer_state": None,
             "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
+            "owned_examples_seen": owned_examples_seen,
+            "replay_examples_seen": replay_examples_seen,
         })
     save_stage_b(
         checkpoint_dir,
@@ -640,6 +726,10 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
             "epochs_completed": int(config["training"]["epochs_b"]),
             "wall_seconds": time.monotonic() - started,
             "selected_epoch": int(config["training"]["epochs_b"]),
+            "replay_fraction": replay_fraction,
+            "owned_examples_seen": owned_examples_seen,
+            "replay_examples_seen": replay_examples_seen,
+            "replay_pool_rows": sum(len(rows) for rows in replay_pools.values()),
         },
     )
     write_owned_expert_validation_ooc(
@@ -747,6 +837,9 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     anchor_lambda = float(stage_cfg.get("lambda_expert_anchor", 0.0))
     if anchor_lambda < 0:
         raise ValueError("training.stage_c.lambda_expert_anchor must be non-negative")
+    reliability_lambda = float(stage_cfg.get("lambda_reliability", 0.0))
+    if reliability_lambda < 0:
+        raise ValueError("training.stage_c.lambda_reliability must be non-negative")
     supervision = stage_cfg.get("gate_supervision", "light_aux")
     aux_lambda = _lambda_dataset_aux(config)
     balance_lambda = float(config["load_balance"]["lambda_balance"])
@@ -779,7 +872,10 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         epoch_started = time.monotonic()
         completed_epoch = epoch + 1
         rng = np.random.default_rng(config.get("seed", 0) + 100_000 + epoch)
-        totals = {"ce": 0.0, "balance": 0.0, "aux": 0.0, "anchor": 0.0}; rows_seen = 0
+        totals = {
+            "ce": 0.0, "balance": 0.0, "aux": 0.0,
+            "anchor": 0.0, "reliability": 0.0,
+        }; rows_seen = 0
         model.train()
         report_progress = _progress_reporter(
             f"Stage C/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
@@ -789,7 +885,15 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
             output = model(features)
             task_gate_weights = _gate_weights_for_task(output["gate_weights"], supervision)
             ownership_ids = dataset_ids if expert_update_policy == "assigned_only" else None
-            if model.routing_mode == "top1":
+            if isinstance(model, ClassConditionalMoEDatasetNIDS):
+                class_gate_weights = model.class_gate_weights(task_gate_weights)
+                training_probs = model.combine_class_conditional_probs_for_training(
+                    class_gate_weights,
+                    output["expert_probs"],
+                    ownership_ids,
+                    expert_update_policy,
+                )
+            elif model.routing_mode == "top1":
                 training_probs = MoEDatasetNIDS.combine_top1_for_training(
                     task_gate_weights,
                     output["selected_probs"],
@@ -805,7 +909,15 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
             balance = load_balance_penalty(output["gate_weights"])
             aux = dataset_aux_loss(output["gate_weights"], dataset_ids) if aux_lambda > 0 else ce.new_zeros(())
             anchor = _expert_anchor_penalty(model, stage_b_anchor) if anchor_lambda > 0 else ce.new_zeros(())
-            loss = ce + balance_lambda * balance + aux_lambda * aux + anchor_lambda * anchor
+            reliability = (
+                model.class_reliability.square().mean()
+                if isinstance(model, ClassConditionalMoEDatasetNIDS)
+                else ce.new_zeros(())
+            )
+            loss = (
+                ce + balance_lambda * balance + aux_lambda * aux
+                + anchor_lambda * anchor + reliability_lambda * reliability
+            )
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
             optimizer_steps += 1; examples_seen += len(row_ids)
             amount = len(row_ids); rows_seen += amount
@@ -813,12 +925,14 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
             totals["balance"] += float(balance.item()) * amount
             totals["aux"] += float(aux.item()) * amount
             totals["anchor"] += float(anchor.item()) * amount
+            totals["reliability"] += float(reliability.item()) * amount
             report_progress(rows_seen)
         report_progress(rows_seen, force=True)
         print(
             f"[Stage C/ooc] epoch {epoch + 1}: CE={totals['ce']/rows_seen:.6f} "
             f"balance={totals['balance']/rows_seen:.6f} aux={totals['aux']/rows_seen:.6f} "
             f"anchor={totals['anchor']/rows_seen:.6f} policy={expert_update_policy} "
+            f"reliability={totals['reliability']/rows_seen:.6f} "
             f"gate_supervision={supervision} rows={rows_seen:,}"
         )
         val_macro_f1 = np.nan
@@ -851,9 +965,11 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
             "train_balance_penalty": average["balance"],
             "train_dataset_aux_loss": average["aux"],
             "train_anchor_penalty": average["anchor"],
+            "train_reliability_penalty": average["reliability"],
             "train_total_loss": (
                 average["ce"] + balance_lambda * average["balance"]
                 + aux_lambda * average["aux"] + anchor_lambda * average["anchor"]
+                + reliability_lambda * average["reliability"]
             ),
             "val_macro_f1": val_macro_f1,
             "best_val_macro_f1": (

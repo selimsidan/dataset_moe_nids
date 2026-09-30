@@ -186,3 +186,87 @@ class MoEDatasetNIDS(nn.Module):
         so callers don't need to know that detail.
         """
         return torch.log(combined_probs + eps)
+
+
+class ClassConditionalMoEDatasetNIDS(MoEDatasetNIDS):
+    """Dense soft MoE with a small expert-by-class reliability matrix.
+
+    The ordinary sample gate remains ``B x D`` and therefore preserves the
+    existing router diagnostics.  A zero-initialized ``D x C`` matrix then
+    adjusts those weights separately for each class.  Zero reliability is
+    exactly the historical probability mixture, making this a nested
+    88-parameter ablation for the four-dataset, 22-class study.
+    """
+
+    def __init__(
+        self,
+        encoder: SharedEncoder,
+        expert_bank: nn.Module,
+        gate: Gate,
+        class_names: list[str],
+        routing_mode: str = "dense",
+    ) -> None:
+        if routing_mode != "dense":
+            raise ValueError("class-conditional reliability currently requires dense routing")
+        super().__init__(encoder, expert_bank, gate, class_names, routing_mode=routing_mode)
+        self.class_reliability = nn.Parameter(
+            torch.zeros(len(self.dataset_names), len(self.class_names))
+        )
+
+    def class_gate_weights(self, gate_weights: torch.Tensor) -> torch.Tensor:
+        """Return normalized expert weights with shape ``B x D x C``."""
+        if gate_weights.ndim != 2 or gate_weights.shape[1] != len(self.dataset_names):
+            raise ValueError("gate_weights must have shape (batch, num_experts)")
+        logits = gate_weights.clamp_min(1e-12).log().unsqueeze(-1)
+        logits = logits + self.class_reliability.unsqueeze(0)
+        return torch.softmax(logits, dim=1)
+
+    @staticmethod
+    def combine_class_conditional_probs_for_training(
+        class_gate_weights: torch.Tensor,
+        expert_probs: torch.Tensor,
+        dataset_ids: torch.Tensor | None,
+        expert_update_policy: str = "all",
+    ) -> torch.Tensor:
+        """Mix per class, then renormalize to a categorical distribution."""
+        if class_gate_weights.shape != expert_probs.shape:
+            raise ValueError("class_gate_weights and expert_probs must have identical shapes")
+        if expert_update_policy == "all":
+            routed_probs = expert_probs
+        elif expert_update_policy == "assigned_only":
+            if dataset_ids is None or dataset_ids.shape != (expert_probs.shape[0],):
+                raise ValueError("dataset_ids must have shape (batch,) for assigned_only updates")
+            if dataset_ids.numel() and (
+                int(dataset_ids.min()) < 0
+                or int(dataset_ids.max()) >= expert_probs.shape[1]
+            ):
+                raise ValueError("dataset_ids contains an expert index outside the active expert bank")
+            assigned = F.one_hot(
+                dataset_ids.to(torch.long), num_classes=expert_probs.shape[1]
+            ).to(torch.bool).unsqueeze(-1)
+            routed_probs = torch.where(assigned, expert_probs, expert_probs.detach())
+        else:
+            raise ValueError(
+                f"Unknown expert_update_policy {expert_update_policy!r}; "
+                "expected 'all' or 'assigned_only'"
+            )
+        scores = (class_gate_weights * routed_probs).sum(dim=1)
+        return scores / scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        z = self.encoder(x)
+        gate_weights = self.gate(z)
+        expert_logits = self.expert_bank(self._expert_input(x, z))
+        expert_probs = F.softmax(expert_logits, dim=-1)
+        class_gate_weights = self.class_gate_weights(gate_weights)
+        combined_probs = self.combine_class_conditional_probs_for_training(
+            class_gate_weights, expert_probs, None, "all"
+        )
+        return {
+            "z": z,
+            "expert_logits": expert_logits,
+            "expert_probs": expert_probs,
+            "gate_weights": gate_weights,
+            "class_gate_weights": class_gate_weights,
+            "combined_probs": combined_probs,
+        }

@@ -50,6 +50,7 @@ from training.out_of_core_train import build_ooc_model
 
 _KNOWN_ARCHITECTURES = (
     "moe_dataset_soft",
+    "moe_dataset_class_conditional",
     "moe_dataset_adapters",
     "moe_dataset_private_encoders",
 )

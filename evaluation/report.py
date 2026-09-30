@@ -21,7 +21,8 @@ from .resource_accounting import write_resource_accounting
 def comparison_table(results_by_variant: dict[str, EvaluationResult]) -> pd.DataFrame:
     """One row per class, one metric group per
     variant -- directly supports pivoting all architecture variants
-    (moe_dataset_soft, moe_basic, moe_dataset_hard_gate, moe_dataset_damex, moe_dataset_adapters,
+    (moe_dataset_soft, moe_dataset_class_conditional, moe_basic,
+    moe_dataset_hard_gate, moe_dataset_damex, moe_dataset_adapters,
     plain_pooled, no_fusion, hard_two_stage) into one ablation table."""
     rows = []
     class_names = next(iter(results_by_variant.values())).class_names

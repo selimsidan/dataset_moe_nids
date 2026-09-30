@@ -71,6 +71,13 @@ def _training_columns(summary: dict | None) -> dict:
                 f"{stage}_selected_epoch": values.get("selected_epoch"),
             }
         )
+    stage_b = (summary or {}).get("B", {})
+    columns.update({
+        "B_owned_examples_seen": stage_b.get("owned_examples_seen", 0),
+        "B_replay_examples_seen": stage_b.get("replay_examples_seen", 0),
+        "B_replay_fraction": stage_b.get("replay_fraction", 0.0),
+        "B_replay_pool_rows": stage_b.get("replay_pool_rows", 0),
+    })
     columns["total_optimizer_steps"] = sum(
         int(columns[f"{stage}_optimizer_steps"]) for stage in ("A", "B", "C", "hard_router", "hard_classifiers")
     )
@@ -101,6 +108,8 @@ def resource_profile(
     if isinstance(model, MoEDatasetNIDS):
         gate_params = parameter_count(model.gate)
         gate_macs = linear_macs(model.gate)
+        if hasattr(model, "class_reliability"):
+            gate_params += int(model.class_reliability.numel())
         if isinstance(model.expert_bank, PrivateEncoderExpertBank):
             encoder_params = parameter_count(model.encoder) + sum(
                 parameter_count(expert.encoder) for expert in model.expert_bank.experts
