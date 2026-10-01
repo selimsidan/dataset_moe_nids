@@ -36,6 +36,9 @@ CONFIGS = {
     "encoder": ("config/compact_soft_moe_depth_encoder_3seed.yaml", 36_892),
     "both": ("config/compact_soft_moe_depth_both_3seed.yaml", 53_532),
     "pooled": ("config/compact_soft_moe_pooled_b10_3seed.yaml", 20_380),
+    "deeper_gate": (
+        "config/compact_soft_moe_deeper_gate_3seed.yaml", 22_332
+    ),
     "class_conditional": (
         "config/compact_soft_moe_class_conditional_3seed.yaml", 20_468
     ),
@@ -69,6 +72,7 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "encoder": ["A", "B", "C"],
         "both": ["B", "C"],
         "pooled": ["B", "C"],
+        "deeper_gate": ["C"],
         "class_conditional": ["C"],
     }
     for name, (path, _parameters) in CONFIGS.items():
@@ -228,6 +232,7 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "31c.ipynb",
         "31depth.ipynb",
         "31_pooledB.ipynb",
+        "31_deeper_C.ipynb",
         "31_class_conditional_routing.ipynb",
     ],
 )
