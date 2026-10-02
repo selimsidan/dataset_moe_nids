@@ -39,6 +39,7 @@ from .model_utils import (
     expert_forward_one,
     expert_names_for_architecture,
     expert_train_params,
+    initialize_global_residual_head,
     initialize_private_expert_encoders,
 )
 from .sampler import ClassBalancedBatchSampler
@@ -145,6 +146,11 @@ def run_stage_b(config: dict, data: PreparedData):
 
     primary_role = "gate_encoder" if bank_kind == "private_encoder" else "encoder"
     encoder = _build_frozen_encoder(config, data, device, primary_role)
+    if bank_kind == "global_residual":
+        stage_a = load_validated_stage_a(
+            config, stage_a_metadata(config, data, encoder_role=primary_role), primary_role
+        )
+        initialize_global_residual_head(expert_bank, stage_a)
     if bank_kind == "private_encoder":
         private_source = _build_frozen_encoder(config, data, device, "private_encoder")
         initialize_private_expert_encoders(expert_bank, private_source)

@@ -313,7 +313,7 @@ python -m training.compact_soft_moe_run \
   --execute --max-new-seeds 3
 ```
 
-Five follow-up notebooks isolate one compact-model question at a time while
+Seven follow-up notebooks isolate one compact-model question at a time while
 retaining Notebook 31's paired seeds, splits, reports, and resumability:
 
 - [`31c.ipynb`](notebooks/31c.ipynb) compares Stage-C learning rates `1e-3`
@@ -326,6 +326,13 @@ retaining Notebook 31's paired seeds, splits, reports, and resumability:
 - [`31_deeper_C.ipynb`](notebooks/31_deeper_C.ipynb) replaces only the linear
   `64 -> 4` gate with a dropout-free `64 -> 32 -> 4` ReLU gate, reuses the
   exact baseline Stage-A/B checkpoints, and retrains only Stage C.
+- [`31_frozen_encoder_expert.ipynb`](notebooks/31_frozen_encoder_expert.ipynb)
+  keeps that same deeper gate but freezes both the shared encoder and all four
+  linear experts during Stage C, isolating gate-only optimization.
+- [`31_global-plus-residual.ipynb`](notebooks/31_global-plus-residual.ipynb)
+  gives every expert the form `global_head(z) + residual_e(z)`: the global
+  linear head is copied exactly from the pooled Stage-A CE probe, every
+  dataset residual starts at zero, and Stage B trains only the owned residual.
 - [`31_class_conditional_routing.ipynb`](notebooks/31_class_conditional_routing.ipynb)
   adds a zero-initialized 4×22 reliability matrix to the sample-level gate
   and retrains only Stage C from the baseline Stage-A/B artifacts.

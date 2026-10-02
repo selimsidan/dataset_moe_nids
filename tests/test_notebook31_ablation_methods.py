@@ -39,6 +39,12 @@ CONFIGS = {
     "deeper_gate": (
         "config/compact_soft_moe_deeper_gate_3seed.yaml", 22_332
     ),
+    "frozen_deeper_gate": (
+        "config/compact_soft_moe_deeper_gate_frozen_stagec_3seed.yaml", 22_332
+    ),
+    "global_residual": (
+        "config/compact_soft_moe_global_residual_3seed.yaml", 21_810
+    ),
     "class_conditional": (
         "config/compact_soft_moe_class_conditional_3seed.yaml", 20_468
     ),
@@ -73,6 +79,8 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "both": ["B", "C"],
         "pooled": ["B", "C"],
         "deeper_gate": ["C"],
+        "frozen_deeper_gate": ["C"],
+        "global_residual": ["B", "C"],
         "class_conditional": ["C"],
     }
     for name, (path, _parameters) in CONFIGS.items():
@@ -233,6 +241,8 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "31depth.ipynb",
         "31_pooledB.ipynb",
         "31_deeper_C.ipynb",
+        "31_frozen_encoder_expert.ipynb",
+        "31_global-plus-residual.ipynb",
         "31_class_conditional_routing.ipynb",
     ],
 )

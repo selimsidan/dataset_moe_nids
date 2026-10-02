@@ -23,7 +23,8 @@ def comparison_table(results_by_variant: dict[str, EvaluationResult]) -> pd.Data
     variant -- directly supports pivoting all architecture variants
     (moe_dataset_soft, moe_dataset_class_conditional, moe_basic,
     moe_dataset_hard_gate, moe_dataset_damex, moe_dataset_adapters,
-    plain_pooled, no_fusion, hard_two_stage) into one ablation table."""
+    moe_dataset_global_residual, plain_pooled, no_fusion, hard_two_stage)
+    into one ablation table."""
     rows = []
     class_names = next(iter(results_by_variant.values())).class_names
     for class_name in class_names:

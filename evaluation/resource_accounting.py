@@ -17,6 +17,7 @@ from torch import nn
 
 from models.adapters import AdapterExpertBank
 from models.baselines import HardTwoStageModel, MatchedDenseClassifier, NoFusionModel
+from models.global_residual_experts import GlobalResidualExpertBank
 from models.moe import MoEDatasetNIDS
 from models.private_encoder_experts import PrivateEncoderExpertBank
 
@@ -133,6 +134,14 @@ def resource_profile(
             shared_m = linear_macs(model.expert_bank.shared_head)
             branch_p = [parameter_count(adapter) + shared_p for adapter in model.expert_bank.adapters]
             branch_m = [linear_macs(adapter) + shared_m for adapter in model.expert_bank.adapters]
+        elif isinstance(model.expert_bank, GlobalResidualExpertBank):
+            encoder_params, encoder_macs = parameter_count(model.encoder), linear_macs(model.encoder)
+            classifier_params = parameter_count(model.expert_bank)
+            classifier_macs = linear_macs(model.expert_bank)
+            shared_p = parameter_count(model.expert_bank.global_head)
+            shared_m = linear_macs(model.expert_bank.global_head)
+            branch_p = [shared_p + parameter_count(residual) for residual in model.expert_bank.residuals]
+            branch_m = [shared_m + linear_macs(residual) for residual in model.expert_bank.residuals]
         else:
             encoder_params, encoder_macs = parameter_count(model.encoder), linear_macs(model.encoder)
             classifier_params = parameter_count(model.expert_bank)

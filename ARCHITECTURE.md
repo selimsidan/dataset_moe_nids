@@ -158,6 +158,20 @@ This is intentionally a representation-capacity ablation rather than a
 capacity-matched method, so resource accounting reports all stored and active
 private encoders explicitly.
 
+### `GlobalResidualExpertBank` — shared boundary plus dataset corrections
+
+`models/global_residual_experts.py`
+
+`architecture=moe_dataset_global_residual` retains the Notebook 31 shared
+encoder and linear gate, but defines expert `e` as
+`global_head(z) + residual_e(z)`. The global linear head is copied exactly
+from the pooled Stage-A CE probe and remains fixed during Stage B. Every
+linear residual is initialized to zero, so all experts initially reproduce
+the pooled classifier exactly; Stage B trains only the residual owned by the
+current dataset. Stage C then follows the ordinary Notebook 31 joint schedule.
+This tests whether a strong shared decision boundary plus small dataset-specific
+corrections generalizes better than four fully independent linear heads.
+
 ## 5. The gate
 
 `models/gate.py::Gate`
@@ -253,6 +267,11 @@ dataset's complete private encoder+head, not merely its downstream head; the
 original frozen instance is used only as the common initialization source and
 later becomes the Stage-C gate encoder.
 
+For `moe_dataset_global_residual`, Stage B first copies the exact Stage-A CE
+probe into the shared global head and then freezes it implicitly by excluding
+it from every per-dataset optimizer. Only the selected zero-initialized
+residual is updated for each dataset.
+
 ### Stage C — Joint fine-tune (`training/stage_c_jointfinetune.py`)
 
 Loads Stage A encoder weights + Stage B expert-bank weights, **instantiates
@@ -278,6 +297,10 @@ over the **task class label**, not dataset ID — guaranteeing
 ones, in every batch. `load_balance_penalty` is ported unchanged from
 `moe_nids/models/losses.py` (coefficient-of-variation-squared over
 per-expert mean gate utilization).
+
+The optional signed control `training.stage_c.freeze_experts=true` freezes the
+entire expert bank during Stage C. Combined with `stage_c_unfreeze=none`, it
+creates the gate-only ablation used by Notebook `31_frozen_encoder_expert`.
 
 ### Resumability
 

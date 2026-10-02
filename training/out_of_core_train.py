@@ -41,13 +41,14 @@ from .checkpoint import (
 )
 from .model_utils import (
     bank_kind_for_architecture,
+    apply_stage_c_trainability,
     build_expert_bank,
     build_model,
     expert_forward_one,
     expert_names_for_architecture,
     expert_train_params,
+    initialize_global_residual_head,
     initialize_private_expert_encoders,
-    model_encoder_modules,
 )
 from .out_of_core_data import OutOfCoreContext, class_counts
 from .stage_c_jointfinetune import _gate_weights_for_task, _lambda_dataset_aux
@@ -588,6 +589,16 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
 
     primary_role = "gate_encoder" if bank_kind == "private_encoder" else "encoder"
     encoder = _frozen_encoder(config, context, device, primary_role)
+    if bank_kind == "global_residual":
+        stage_a = load_validated_stage_a(
+            config,
+            stage_a_metadata(
+                config, data, split_signature=_hash(context.split_signatures),
+                feature_columns=context.feature_columns, encoder_role=primary_role,
+            ),
+            primary_role,
+        )
+        initialize_global_residual_head(bank, stage_a)
     if bank_kind == "private_encoder":
         private_source = _frozen_encoder(config, context, device, "private_encoder")
         initialize_private_expert_encoders(bank, private_source)
@@ -739,17 +750,6 @@ def run_stage_b_ooc(config: dict, context: OutOfCoreContext):
     clear_progress(checkpoint_dir, "B")
     return bank
 
-
-def _set_encoder_trainable(encoder, mode: str):
-    for parameter in encoder.parameters():
-        parameter.requires_grad_(mode == "all")
-    if mode == "last_layer":
-        for parameter in encoder.last_layer_parameters():
-            parameter.requires_grad_(True)
-    elif mode not in {"all", "none"}:
-        raise ValueError(f"Unknown stage_c_unfreeze mode: {mode}")
-
-
 def build_ooc_model(config: dict, context: OutOfCoreContext, device) -> torch.nn.Module:
     data = context.data; model_cfg = config["model"]
     role = "gate_encoder" if config["architecture"] == "moe_dataset_private_encoders" else "encoder"
@@ -772,6 +772,7 @@ def build_ooc_model(config: dict, context: OutOfCoreContext, device) -> torch.nn
         expected_bank_kind=bank_kind_for_architecture(config["architecture"]),
     )
     model.expert_bank.load_state_dict(stage_b["expert_bank_state"])
+    apply_stage_c_trainability(model, config)
     return model
 
 
@@ -820,8 +821,7 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     torch.manual_seed(config.get("seed", 0))
     model = build_ooc_model(config, context, device)
     stage_b_anchor = _expert_anchor(model)
-    for encoder in model_encoder_modules(model):
-        _set_encoder_trainable(encoder, config["training"]["stage_c_unfreeze"])
+    apply_stage_c_trainability(model, config)
     lr, weight_decay = optimizer_hparams(config, "c")
     optimizer = torch.optim.Adam(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -832,7 +832,7 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
     expert_update_policy = stage_cfg.get("expert_update_policy", "all")
     if expert_update_policy not in {"all", "assigned_only"}:
         raise ValueError("training.stage_c.expert_update_policy must be 'all' or 'assigned_only'")
-    if expert_update_policy == "assigned_only" and bank_kind_for_architecture(config["architecture"]) not in {"full", "private_encoder"}:
+    if expert_update_policy == "assigned_only" and bank_kind_for_architecture(config["architecture"]) not in {"full", "private_encoder", "global_residual"}:
         raise ValueError("assigned_only expert updates require independent full experts, not a shared adapter head")
     anchor_lambda = float(stage_cfg.get("lambda_expert_anchor", 0.0))
     if anchor_lambda < 0:

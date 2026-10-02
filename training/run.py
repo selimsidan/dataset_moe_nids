@@ -51,6 +51,7 @@ MOE_ARCHITECTURES = (
     "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
     "moe_dataset_adapters", "moe_dataset_private_encoders", "moe_basic",
     "moe_dataset_class_conditional",
+    "moe_dataset_global_residual",
 )
 ALL_ARCHITECTURES = (*MOE_ARCHITECTURES, "matched_dense", "plain_pooled", "no_fusion", "hard_two_stage")
 

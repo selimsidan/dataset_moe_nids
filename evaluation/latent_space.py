@@ -1,8 +1,9 @@
 """Checkpoint-aware latent-space evaluation, generalized across every
 architecture used by the greedy MoE study: shared encoder + shared experts
 (``moe_dataset_soft``), shared encoder + per-dataset FiLM adapters
-(``moe_dataset_adapters``), and fully private per-dataset encoders
-(``moe_dataset_private_encoders``).
+(``moe_dataset_adapters``), fully private per-dataset encoders
+(``moe_dataset_private_encoders``), and global-plus-residual heads that retain
+the ordinary shared latent (``moe_dataset_global_residual``).
 
 The report compares the pooled Stage-A encoder, the Stage-B gate/experts, and
 the Stage-C gate/experts on identical stratified rows.  All quantitative
@@ -37,6 +38,7 @@ from sklearn.preprocessing import normalize
 from models.adapters import AdapterExpertBank
 from models.dataset_experts import DatasetExpertBank
 from models.encoder import SharedEncoder, build_encoder, resolve_encoder_config
+from models.global_residual_experts import GlobalResidualExpertBank
 from models.private_encoder_experts import PrivateEncoderExpertBank
 from training.checkpoint import (
     STAGE_C_FILE,
@@ -53,6 +55,7 @@ _KNOWN_ARCHITECTURES = (
     "moe_dataset_class_conditional",
     "moe_dataset_adapters",
     "moe_dataset_private_encoders",
+    "moe_dataset_global_residual",
 )
 
 
@@ -119,6 +122,8 @@ def load_latent_snapshots(
       the shared latent; snapshots compose the encoder with each adapter.
     - ``moe_dataset_private_encoders``: each dataset has a fully independent
       encoder; snapshots use those encoders directly (unchanged behavior).
+    - ``moe_dataset_global_residual``: global and residual heads classify the
+      same shared latent, so its snapshot contract matches the compact soft MoE.
     """
     architecture = config["architecture"]
     if architecture not in _KNOWN_ARCHITECTURES:
@@ -185,7 +190,7 @@ def load_latent_snapshots(
                     _EncoderThenAdapter(stage_b_encoder, adapter).to(device),
                     "adapted_expert",
                 ))
-        elif not isinstance(bank, DatasetExpertBank):
+        elif not isinstance(bank, (DatasetExpertBank, GlobalResidualExpertBank)):
             raise TypeError(f"unrecognized expert bank type {type(bank)!r}")
 
     if "C" in stages:
@@ -200,7 +205,7 @@ def load_latent_snapshots(
                 snapshots.append(LatentSnapshot(
                     "C", f"expert::{name}", _EncoderThenAdapter(model.encoder, adapter), "adapted_expert"
                 ))
-        elif not isinstance(model.expert_bank, DatasetExpertBank):
+        elif not isinstance(model.expert_bank, (DatasetExpertBank, GlobalResidualExpertBank)):
             raise TypeError(f"unrecognized expert bank type {type(model.expert_bank)!r}")
     for snapshot in snapshots:
         if snapshot.module is not None:

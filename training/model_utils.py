@@ -13,16 +13,19 @@ from models.baselines import MatchedDenseClassifier, MatchedDenseHead
 from models.dataset_experts import DatasetExpertBank
 from models.encoder import SharedEncoder, resolve_encoder_config
 from models.gate import Gate
+from models.global_residual_experts import GlobalResidualExpertBank
 from models.moe import ClassConditionalMoEDatasetNIDS, MoEDatasetNIDS
 from models.private_encoder_experts import PrivateEncoderExpertBank
 
 ADAPTER_ARCHITECTURES = {"moe_dataset_adapters"}
 BASIC_MOE_ARCHITECTURES = {"moe_basic"}
 PRIVATE_ENCODER_ARCHITECTURES = {"moe_dataset_private_encoders"}
+GLOBAL_RESIDUAL_ARCHITECTURES = {"moe_dataset_global_residual"}
 DATASET_MOE_ARCHITECTURES = {
     "moe_dataset_soft", "moe_dataset_hard_gate", "moe_dataset_damex",
     "moe_dataset_adapters", "moe_dataset_private_encoders",
     "moe_dataset_class_conditional",
+    "moe_dataset_global_residual",
 }
 
 
@@ -179,6 +182,8 @@ def bank_kind_for_architecture(architecture: str) -> str:
         return "adapter"
     if architecture in PRIVATE_ENCODER_ARCHITECTURES:
         return "private_encoder"
+    if architecture in GLOBAL_RESIDUAL_ARCHITECTURES:
+        return "global_residual"
     return "full"
 
 
@@ -225,8 +230,18 @@ def build_expert_bank(
             expert_dropout=expert_cfg["dropout"],
             encoder_config=encoder_cfg,
         )
+    if bank_kind == "global_residual":
+        expert_cfg = model_cfg["expert"]
+        if list(expert_cfg.get("hidden_dims", [])):
+            raise ValueError("global-residual experts currently require linear residual heads")
+        return GlobalResidualExpertBank(
+            dataset_names=dataset_names,
+            latent_dim=latent_dim,
+            num_classes=num_classes,
+        )
     raise ValueError(
-        f"Unknown bank_kind '{bank_kind}'. Expected 'full', 'adapter', or 'private_encoder'."
+        f"Unknown bank_kind '{bank_kind}'. Expected 'full', 'adapter', "
+        "'private_encoder', or 'global_residual'."
     )
 
 
@@ -234,6 +249,17 @@ def initialize_private_expert_encoders(bank: nn.Module, stage_a_encoder: SharedE
     """Clone Stage-A weights when the bank owns full private encoders."""
     if isinstance(bank, PrivateEncoderExpertBank):
         bank.initialize_encoders(stage_a_encoder)
+
+
+def initialize_global_residual_head(bank: nn.Module, stage_a_checkpoint: dict) -> None:
+    """Copy and freeze the pooled Stage-A CE probe for residual-only Stage B."""
+    if isinstance(bank, GlobalResidualExpertBank):
+        state = stage_a_checkpoint.get("representation_state")
+        if state is None:
+            raise ValueError("Stage-A checkpoint does not contain representation_state")
+        bank.initialize_global_head(state)
+        for parameter in bank.global_head.parameters():
+            parameter.requires_grad_(False)
 
 
 def model_encoder_modules(model: MoEDatasetNIDS) -> list[SharedEncoder]:
@@ -252,7 +278,9 @@ def expert_train_params(bank: nn.Module, dataset_idx: int) -> list[torch.nn.Para
     subset of a shared head) -- sequential warm-start across datasets will
     therefore let later datasets' warm-start nudge the shared head touched
     by earlier ones, which is expected/documented behavior for this
-    ablation, not a bug.
+    ablation, not a bug. For the global-plus-residual bank, ``experts`` is a
+    compatibility alias for the residual heads, so Stage B deliberately
+    optimizes only the owned residual and keeps the Stage-A global head fixed.
     """
     if isinstance(bank, AdapterExpertBank):
         return list(bank.adapters[dataset_idx].parameters()) + list(bank.shared_head.parameters())
@@ -268,7 +296,25 @@ def expert_forward_one(bank: nn.Module, dataset_idx: int, representation: torch.
     """
     if isinstance(bank, AdapterExpertBank):
         return bank.shared_head(bank.adapters[dataset_idx](representation))
+    if isinstance(bank, GlobalResidualExpertBank):
+        return bank.forward_one(dataset_idx, representation)
     return bank.experts[dataset_idx](representation)
+
+
+def apply_stage_c_trainability(model: MoEDatasetNIDS, config: dict) -> None:
+    """Apply signed encoder/expert freezing before Stage-C optimization or reporting."""
+    mode = config["training"].get("stage_c_unfreeze", "all")
+    for encoder in model_encoder_modules(model):
+        for parameter in encoder.parameters():
+            parameter.requires_grad_(mode == "all")
+        if mode == "last_layer":
+            for parameter in encoder.last_layer_parameters():
+                parameter.requires_grad_(True)
+        elif mode not in {"all", "none"}:
+            raise ValueError(f"Unknown stage_c_unfreeze mode: {mode}")
+    if bool(config["training"].get("stage_c", {}).get("freeze_experts", False)):
+        for parameter in model.expert_bank.parameters():
+            parameter.requires_grad_(False)
 
 
 def build_model(
