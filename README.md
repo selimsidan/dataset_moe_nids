@@ -313,7 +313,7 @@ python -m training.compact_soft_moe_run \
   --execute --max-new-seeds 3
 ```
 
-Seven follow-up notebooks isolate one compact-model question at a time while
+Eight follow-up notebooks isolate one compact-model question at a time while
 retaining Notebook 31's paired seeds, splits, reports, and resumability:
 
 - [`31c.ipynb`](notebooks/31c.ipynb) compares Stage-C learning rates `1e-3`
@@ -336,10 +336,16 @@ retaining Notebook 31's paired seeds, splits, reports, and resumability:
 - [`31_class_conditional_routing.ipynb`](notebooks/31_class_conditional_routing.ipynb)
   adds a zero-initialized 4×22 reliability matrix to the sample-level gate
   and retrains only Stage C from the baseline Stage-A/B artifacts.
+- [`32_frozen_body_gate_depth_lr.ipynb`](notebooks/32_frozen_body_gate_depth_lr.ipynb)
+  freezes the Notebook 31 encoder and experts and runs the complete linear
+  versus one-hidden-layer gate × `1e-3` versus `3e-4` Stage-C LR factorial.
+  It reuses the completed deeper-gate/`1e-3` cell, so only three new gate-only
+  Stage-C conditions require training.
 
-Each notebook completes the Notebook 31 baseline first if needed, defaults to
-a dry run, gives every condition a separate immutable prefix, and displays
-paired validation deltas before descriptive locked-test comparisons.
+The studies reuse the signed Notebook 31 baseline artifacts (and the earlier
+notebooks complete them first when needed), default to a dry run, give every
+condition a separate immutable prefix, and display paired validation deltas
+before descriptive locked-test comparisons.
 
 In Colab, add a secret named `GITHUB_TOKEN` (fine-grained token with read-only
 Contents access to this repository) and grant the notebook access. Never put

@@ -17,7 +17,7 @@ from training.compact_soft_moe_run import CompactSoftMoEStudy
 from training.checkpoint import load_stage_b
 from training.config import load_config
 from training.dataset import PreparedData, PreparedSplit
-from training.model_utils import build_model
+from training.model_utils import apply_stage_c_trainability, build_model
 from training.out_of_core_data import OutOfCoreContext
 from training.out_of_core_train import run_stage_a_ooc, run_stage_b_ooc
 from training.pooled_replay import (
@@ -42,6 +42,15 @@ CONFIGS = {
     "frozen_deeper_gate": (
         "config/compact_soft_moe_deeper_gate_frozen_stagec_3seed.yaml", 22_332
     ),
+    "frozen_linear_gate_lr1e3": (
+        "config/compact_soft_moe_frozen_stagec_linear_gate_lr1e3_3seed.yaml", 20_380
+    ),
+    "frozen_linear_gate_lr3e4": (
+        "config/compact_soft_moe_frozen_stagec_linear_gate_lr3e4_3seed.yaml", 20_380
+    ),
+    "frozen_deeper_gate_lr3e4": (
+        "config/compact_soft_moe_frozen_stagec_deeper_gate_lr3e4_3seed.yaml", 22_332
+    ),
     "global_residual": (
         "config/compact_soft_moe_global_residual_3seed.yaml", 21_810
     ),
@@ -49,6 +58,13 @@ CONFIGS = {
         "config/compact_soft_moe_class_conditional_3seed.yaml", 20_468
     ),
 }
+
+NOTEBOOK32_CONFIGS = (
+    "config/compact_soft_moe_frozen_stagec_linear_gate_lr1e3_3seed.yaml",
+    "config/compact_soft_moe_frozen_stagec_linear_gate_lr3e4_3seed.yaml",
+    "config/compact_soft_moe_deeper_gate_frozen_stagec_3seed.yaml",
+    "config/compact_soft_moe_frozen_stagec_deeper_gate_lr3e4_3seed.yaml",
+)
 
 
 @pytest.mark.parametrize("_name,item", CONFIGS.items())
@@ -80,6 +96,9 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "pooled": ["B", "C"],
         "deeper_gate": ["C"],
         "frozen_deeper_gate": ["C"],
+        "frozen_linear_gate_lr1e3": ["C"],
+        "frozen_linear_gate_lr3e4": ["C"],
+        "frozen_deeper_gate_lr3e4": ["C"],
         "global_residual": ["B", "C"],
         "class_conditional": ["C"],
     }
@@ -92,6 +111,28 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
             execute=False,
         )
         assert runner._final_nested(0)["training"]["stages"] == expected[name]
+
+
+def test_notebook32_is_complete_frozen_body_gate_depth_lr_factorial():
+    combinations = set()
+    for path in NOTEBOOK32_CONFIGS:
+        study = yaml.safe_load(Path(path).read_text())
+        backbone = study["backbone"]
+        gate_dims = tuple(backbone["model"]["gate"]["hidden_dims"])
+        stage_c_lr = backbone["training"]["stage_c"]["optimizer"]["lr"]
+        combinations.add((gate_dims, stage_c_lr))
+        assert study["reuse_stage_a_from_prefix"] == study["reuse_stage_b_from_prefix"]
+        assert backbone["training"]["stage_c_unfreeze"] == "none"
+        assert backbone["training"]["stage_c"]["freeze_experts"] is True
+        encoder = build_encoder(47, 64, backbone["model"]["encoder"])
+        model = build_model(
+            backbone["architecture"], encoder, ["A", "B", "C", "D"],
+            [f"class_{index}" for index in range(22)], backbone["model"],
+        )
+        apply_stage_c_trainability(model, backbone)
+        expected_trainable = 260 if not gate_dims else 2_212
+        assert sum(p.numel() for p in model.parameters() if p.requires_grad) == expected_trainable
+    assert combinations == {((), 0.001), ((), 0.0003), ((32,), 0.001), ((32,), 0.0003)}
 
 
 def test_zero_reliability_is_exactly_the_original_probability_mixture():
@@ -244,6 +285,7 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "31_frozen_encoder_expert.ipynb",
         "31_global-plus-residual.ipynb",
         "31_class_conditional_routing.ipynb",
+        "32_frozen_body_gate_depth_lr.ipynb",
     ],
 )
 def test_requested_notebooks_are_valid_and_default_to_dry_run(filename):
