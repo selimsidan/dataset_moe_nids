@@ -57,6 +57,10 @@ CONFIGS = {
     "class_conditional": (
         "config/compact_soft_moe_class_conditional_3seed.yaml", 20_468
     ),
+    "class_conditional_frozen_deeper_gate": (
+        "config/compact_soft_moe_class_conditional_deeper_gate_frozen_stagec_3seed.yaml",
+        22_420,
+    ),
 }
 
 NOTEBOOK32_CONFIGS = (
@@ -101,6 +105,7 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "frozen_deeper_gate_lr3e4": ["C"],
         "global_residual": ["B", "C"],
         "class_conditional": ["C"],
+        "class_conditional_frozen_deeper_gate": ["C"],
     }
     for name, (path, _parameters) in CONFIGS.items():
         runner = CompactSoftMoEStudy(
@@ -133,6 +138,55 @@ def test_notebook32_is_complete_frozen_body_gate_depth_lr_factorial():
         expected_trainable = 260 if not gate_dims else 2_212
         assert sum(p.numel() for p in model.parameters() if p.requires_grad) == expected_trainable
     assert combinations == {((), 0.001), ((), 0.0003), ((32,), 0.001), ((32,), 0.0003)}
+
+
+def test_notebook40_changes_only_class_conditional_reliability():
+    reference = yaml.safe_load(Path(
+        "config/compact_soft_moe_deeper_gate_frozen_stagec_3seed.yaml"
+    ).read_text())
+    candidate = yaml.safe_load(Path(
+        "config/compact_soft_moe_class_conditional_deeper_gate_frozen_stagec_3seed.yaml"
+    ).read_text())
+    assert reference["seeds"] == candidate["seeds"] == [0, 1, 2]
+    assert reference["reuse_stage_a_from_prefix"] == candidate["reuse_stage_a_from_prefix"]
+    assert reference["reuse_stage_b_from_prefix"] == candidate["reuse_stage_b_from_prefix"]
+    reference_backbone = copy.deepcopy(reference["backbone"])
+    candidate_backbone = copy.deepcopy(candidate["backbone"])
+    assert reference_backbone.pop("architecture") == "moe_dataset_soft"
+    assert candidate_backbone.pop("architecture") == "moe_dataset_class_conditional"
+    assert candidate_backbone["training"]["stage_c"].pop("lambda_reliability") == 0.0001
+    assert reference_backbone == candidate_backbone
+
+    model_cfg = candidate["backbone"]["model"]
+    reference_model = build_model(
+        reference["backbone"]["architecture"],
+        build_encoder(47, 64, model_cfg["encoder"]),
+        ["A", "B", "C", "D"],
+        [f"class_{index}" for index in range(22)],
+        model_cfg,
+    )
+    model = build_model(
+        candidate["backbone"]["architecture"],
+        build_encoder(47, 64, model_cfg["encoder"]),
+        ["A", "B", "C", "D"],
+        [f"class_{index}" for index in range(22)],
+        model_cfg,
+    )
+    apply_stage_c_trainability(model, candidate["backbone"])
+    assert model.class_reliability.shape == (4, 22)
+    assert torch.count_nonzero(model.class_reliability) == 0
+    assert sum(parameter.numel() for parameter in model.parameters()) == 22_420
+    assert sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad) == 2_300
+    model.encoder.load_state_dict(reference_model.encoder.state_dict())
+    model.expert_bank.load_state_dict(reference_model.expert_bank.state_dict())
+    model.gate.load_state_dict(reference_model.gate.state_dict())
+    reference_model.eval(); model.eval()
+    inputs = torch.randn(11, 47)
+    assert torch.allclose(
+        reference_model(inputs)["combined_probs"],
+        model(inputs)["combined_probs"],
+        atol=1e-7,
+    )
 
 
 def test_zero_reliability_is_exactly_the_original_probability_mixture():
@@ -286,6 +340,7 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "31_global-plus-residual.ipynb",
         "31_class_conditional_routing.ipynb",
         "32_frozen_body_gate_depth_lr.ipynb",
+        "40_class_conditional_frozen_deep_gate.ipynb",
     ],
 )
 def test_requested_notebooks_are_valid_and_default_to_dry_run(filename):

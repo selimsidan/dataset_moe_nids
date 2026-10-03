@@ -313,7 +313,7 @@ python -m training.compact_soft_moe_run \
   --execute --max-new-seeds 3
 ```
 
-Eight follow-up notebooks isolate one compact-model question at a time while
+Nine follow-up notebooks isolate one compact-model question at a time while
 retaining Notebook 31's paired seeds, splits, reports, and resumability:
 
 - [`31c.ipynb`](notebooks/31c.ipynb) compares Stage-C learning rates `1e-3`
@@ -341,6 +341,11 @@ retaining Notebook 31's paired seeds, splits, reports, and resumability:
   versus one-hidden-layer gate × `1e-3` versus `3e-4` Stage-C LR factorial.
   It reuses the completed deeper-gate/`1e-3` cell, so only three new gate-only
   Stage-C conditions require training.
+- [`40_class_conditional_frozen_deep_gate.ipynb`](notebooks/40_class_conditional_frozen_deep_gate.ipynb)
+  takes the frozen `64 -> 32 -> 4` gate-only winner from Notebook 31, adds only
+  a zero-initialized `4 x 22` class-reliability matrix, and trains the gate and
+  reliability parameters against the existing paired reference without
+  retraining its frozen encoder or experts.
 
 The studies reuse the signed Notebook 31 baseline artifacts (and the earlier
 notebooks complete them first when needed), default to a dry run, give every
