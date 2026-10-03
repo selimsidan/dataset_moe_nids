@@ -313,7 +313,7 @@ python -m training.compact_soft_moe_run \
   --execute --max-new-seeds 3
 ```
 
-Nine follow-up notebooks isolate one compact-model question at a time while
+Ten follow-up notebooks isolate one compact-model question at a time while
 retaining Notebook 31's paired seeds, splits, reports, and resumability:
 
 - [`31c.ipynb`](notebooks/31c.ipynb) compares Stage-C learning rates `1e-3`
@@ -346,6 +346,11 @@ retaining Notebook 31's paired seeds, splits, reports, and resumability:
   a zero-initialized `4 x 22` class-reliability matrix, and trains the gate and
   reliability parameters against the existing paired reference without
   retraining its frozen encoder or experts.
+- [`40_balanced_supcon.ipynb`](notebooks/40_balanced_supcon.ipynb) retains that
+  same deployed frozen-body deeper-gate architecture but retrains Stage A with
+  weighted CE plus weight-`0.1` balanced SupCon, rebuilds the linear Stage-B
+  experts on the resulting latent space, and again trains only the gate in
+  Stage C. Legacy sampling is retained to isolate the representation loss.
 
 The studies reuse the signed Notebook 31 baseline artifacts (and the earlier
 notebooks complete them first when needed), default to a dry run, give every

@@ -1,0 +1,42 @@
+format_version: 1
+seeds: [0, 1, 2]
+expected_input_features: 47
+expected_classes: 22
+expected_total_parameters: 22332
+selection: {primary_metric: macro_f1, rare_validation_min_support: 20, rare_validation_max_support: 200}
+backbone:
+  architecture: moe_dataset_soft
+  data:
+    active_datasets: [NF-UNSW-NB15-v3, NF-ToN-IoT-v3, NF-BoT-IoT-v3, NF-CICIDS2018-v3]
+  model:
+    latent_dim: 64
+    encoder: {kind: mlp, hidden_dims: [128], activation: relu, dropout: 0.2}
+    expert: {hidden_dims: [], dropout: 0.2}
+    gate: {hidden_dims: [32], routing: dense}
+  load_balance: {lambda_balance: 0.1}
+  training:
+    device: cuda
+    deterministic: true
+    batch_size: 512
+    min_per_class_per_batch: 4
+    epochs_a: 30
+    epochs_b: 10
+    epochs_c: 30
+    lr: 0.001
+    weight_decay: 0.0
+    selection_mode: best_val
+    early_stopping_patience: 5
+    freeze_encoder_stage_b: true
+    stage_c_unfreeze: none
+    run_final_evaluation: true
+    representation: {objective: balanced_supcon, sampling: legacy, class_weighting: legacy, weight: 0.1, temperature: 0.1, center_weight: 0.01, arc_margin: 0.3, arc_scale: 30.0}
+    stage_a: {optimizer: {lr: 0.001, weight_decay: 0.0}}
+    stage_b: {warmstart_mode: dataset, optimizer: {lr: 0.001, weight_decay: 0.0}}
+    stage_c:
+      gate_supervision: none
+      expert_update_policy: all
+      freeze_experts: true
+      lambda_expert_anchor: 0.0
+      optimizer: {lr: 0.001, weight_decay: 0.0}
+  evaluation:
+    latent: {enabled: false, include_private_initialization: false, split: val, stages: [A, B, C], max_train_rows: 20000, max_eval_rows: 5000, max_silhouette_rows: 5000, max_per_class_dataset: 250, batch_size: 4096, knn_neighbors: 5, random_seed: 0}

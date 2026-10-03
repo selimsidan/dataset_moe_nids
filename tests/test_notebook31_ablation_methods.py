@@ -61,6 +61,10 @@ CONFIGS = {
         "config/compact_soft_moe_class_conditional_deeper_gate_frozen_stagec_3seed.yaml",
         22_420,
     ),
+    "balanced_supcon_frozen_deeper_gate": (
+        "config/compact_soft_moe_balanced_supcon_frozen_deeper_gate_3seed.yaml",
+        22_332,
+    ),
 }
 
 NOTEBOOK32_CONFIGS = (
@@ -106,6 +110,7 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "global_residual": ["B", "C"],
         "class_conditional": ["C"],
         "class_conditional_frozen_deeper_gate": ["C"],
+        "balanced_supcon_frozen_deeper_gate": ["A", "B", "C"],
     }
     for name, (path, _parameters) in CONFIGS.items():
         runner = CompactSoftMoEStudy(
@@ -187,6 +192,42 @@ def test_notebook40_changes_only_class_conditional_reliability():
         model(inputs)["combined_probs"],
         atol=1e-7,
     )
+
+
+def test_notebook40_balanced_supcon_changes_only_stage_a_objective():
+    reference = yaml.safe_load(Path(
+        "config/compact_soft_moe_deeper_gate_frozen_stagec_3seed.yaml"
+    ).read_text())
+    candidate = yaml.safe_load(Path(
+        "config/compact_soft_moe_balanced_supcon_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    assert reference["seeds"] == candidate["seeds"] == [0, 1, 2]
+    assert "reuse_stage_a_from_prefix" not in candidate
+    assert "reuse_stage_b_from_prefix" not in candidate
+    reference_backbone = copy.deepcopy(reference["backbone"])
+    candidate_backbone = copy.deepcopy(candidate["backbone"])
+    reference_representation = reference_backbone["training"]["representation"]
+    candidate_representation = candidate_backbone["training"]["representation"]
+    assert reference_representation["objective"] == "ce"
+    assert candidate_representation["objective"] == "balanced_supcon"
+    assert candidate_representation["sampling"] == "legacy"
+    assert candidate_representation["class_weighting"] == "legacy"
+    assert candidate_representation["weight"] == 0.1
+    assert candidate_representation["temperature"] == 0.1
+    reference_representation["objective"] = "balanced_supcon"
+    assert reference_backbone == candidate_backbone
+
+    model_cfg = candidate_backbone["model"]
+    model = build_model(
+        candidate_backbone["architecture"],
+        build_encoder(47, 64, model_cfg["encoder"]),
+        ["A", "B", "C", "D"],
+        [f"class_{index}" for index in range(22)],
+        model_cfg,
+    )
+    apply_stage_c_trainability(model, candidate_backbone)
+    assert sum(parameter.numel() for parameter in model.parameters()) == 22_332
+    assert sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad) == 2_212
 
 
 def test_zero_reliability_is_exactly_the_original_probability_mixture():
@@ -341,6 +382,7 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "31_class_conditional_routing.ipynb",
         "32_frozen_body_gate_depth_lr.ipynb",
         "40_class_conditional_frozen_deep_gate.ipynb",
+        "40_balanced_supcon.ipynb",
     ],
 )
 def test_requested_notebooks_are_valid_and_default_to_dry_run(filename):
