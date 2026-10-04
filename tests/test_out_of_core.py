@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from data import paths
 from data.out_of_core import class_split_quotas, prepare_dataset
@@ -16,7 +17,15 @@ from training.out_of_core_train import _expert_optimizer as _ooc_expert_optimize
 from training.out_of_core_train import shuffled_row_batches
 from training.out_of_core_data import OutOfCoreContext, prepare_out_of_core_data
 from training.dataset import PreparedData, PreparedSplit
-from training.out_of_core_train import ensure_run_contract, run_stage_a_ooc, run_stage_b_ooc, run_stage_c_ooc
+from training.out_of_core_train import (
+    CONFUSION_ADAPTIVE_MATRIX_FILE,
+    CONFUSION_ADAPTIVE_RIVAL_FILE,
+    CONFUSION_ADAPTIVE_SUMMARY_FILE,
+    ensure_run_contract,
+    run_stage_a_ooc,
+    run_stage_b_ooc,
+    run_stage_c_ooc,
+)
 from training.stage_b_warmstart import _expert_optimizer as _memory_expert_optimizer
 from evaluation.out_of_core_report import evaluate_and_report_ooc
 
@@ -108,6 +117,67 @@ def test_stage_schedule_and_final_evaluation_are_not_part_of_run_contract(tmp_pa
     assert "save_epoch_history" not in stage_a_contract["training"]
 
 
+def test_confusion_adaptive_stage_a_writes_epoch_artifacts_and_checkpoint_state(tmp_path):
+    rng = np.random.default_rng(19)
+
+    def split(rows):
+        return PreparedSplit(
+            rng.normal(size=(rows, 5)).astype(np.float32),
+            np.tile(np.arange(3), rows // 3).astype(np.int16),
+            np.zeros(rows, dtype=np.int16),
+            None,
+        )
+
+    train, val, test = split(30), split(12), split(12)
+    data = PreparedData(None, ["Benign", "AttackA", "AttackB"], ["A"], train, val, test)
+    context = OutOfCoreContext(data, {}, {"A": "split"}, "prep", "unused", [f"f{i}" for i in range(5)])
+    checkpoint_dir = tmp_path / "checkpoints"
+    config = {
+        "seed": 0,
+        "architecture": "moe_dataset_soft",
+        "model": {
+            "latent_dim": 4,
+            "encoder": {"hidden_dims": [7], "activation": "relu", "dropout": 0.0},
+            "expert": {"hidden_dims": [], "dropout": 0.0},
+            "gate": {"hidden_dims": [3], "routing": "dense"},
+        },
+        "load_balance": {"lambda_balance": 0.1},
+        "training": {
+            "device": "cpu", "batch_size": 6, "epochs_a": 3,
+            "lr": 0.001, "weight_decay": 0.0,
+            "checkpoint_dir": str(checkpoint_dir), "save_epoch_history": True,
+            "shuffle_block_rows": 12, "shuffle_buffer_blocks": 2,
+            "representation": {
+                "objective": "confusion_adaptive_margin",
+                "sampling": "legacy", "class_weighting": "legacy",
+                "weight": 0.1, "temperature": 0.1,
+                "confusion_warmup_epochs": 1, "confusion_ema": 0.5,
+                "confusion_shrinkage": 100.0, "confusion_top_k": 2,
+                "confusion_max_margin": 0.15,
+            },
+        },
+    }
+    run_stage_a_ooc(config, context)
+
+    matrices = pd.read_csv(checkpoint_dir / CONFUSION_ADAPTIVE_MATRIX_FILE)
+    rivals = pd.read_csv(checkpoint_dir / CONFUSION_ADAPTIVE_RIVAL_FILE)
+    summary = pd.read_csv(checkpoint_dir / CONFUSION_ADAPTIVE_SUMMARY_FILE)
+    assert set(matrices["matrix"]) == {"raw", "shrunk", "ema", "margins"}
+    assert set(matrices["epoch"]) == {1, 2, 3}
+    assert set(rivals["rank"]) == {1, 2}
+    assert summary["proxy_active_during_epoch"].tolist() == [False, True, True]
+    assert (summary["train_weighted_proxy_margin_loss"] >= 0).all()
+    history = pd.read_csv(checkpoint_dir / "Training_History.csv")
+    assert history["train_weighted_representation_loss"].notna().all()
+    assert history["train_representation_fraction"].between(0, 1).all()
+
+    checkpoint = torch.load(checkpoint_dir / "stage_a_encoder.pt", map_location="cpu")
+    state = checkpoint["representation_state"]
+    assert state["confusion_initialized"].item()
+    assert state["confusion_ema"].shape == (3, 3)
+    assert state["confusion_margins"].max() <= 0.15
+
+
 @pytest.mark.parametrize("architecture", ["moe_dataset_soft", "moe_dataset_private_encoders"])
 def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
     rng = np.random.default_rng(4)
@@ -183,6 +253,8 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
     assert manifest["trial_id"] == "synthetic-seed0"
     assert manifest["resolved_experiment"]["expert_hidden_dims"] == [8]
     assert "Representation_Batch_Coverage.csv" in manifest["report_files"]
+    validation = pd.read_csv(tmp_path / "results" / "Validation_Overall_Metrics.csv")
+    assert "weighted_f1" in validation
     history = pd.read_csv(tmp_path / "checkpoints" / "Training_History.csv")
     assert set(history["stage"]) == {"A", "B", "C"}
     assert not history.duplicated(["seed", "stage", "encoder_role", "dataset", "epoch"]).any()

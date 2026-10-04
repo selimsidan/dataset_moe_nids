@@ -26,6 +26,8 @@ HISTORY_COLUMNS = [
     "train_owned_ce_loss",
     "train_replay_ce_loss",
     "train_representation_loss",
+    "train_weighted_representation_loss",
+    "train_representation_fraction",
     "train_balance_penalty",
     "train_dataset_aux_loss",
     "train_anchor_penalty",

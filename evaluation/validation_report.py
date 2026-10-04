@@ -29,6 +29,10 @@ def _rows_from_confusion(confusion: np.ndarray, class_names: list[str]) -> tuple
     present = support > 0
     overall = {
         "macro_f1": float(f1[present].mean()) if present.any() else 0.0,
+        "weighted_f1": (
+            float(np.average(f1[present], weights=support[present]))
+            if present.any() and support[present].sum() else 0.0
+        ),
         "macro_precision": float(precision[present].mean()) if present.any() else 0.0,
         "macro_recall": float(recall[present].mean()) if present.any() else 0.0,
         "accuracy": float(true_positive.sum() / support.sum()) if support.sum() else 0.0,

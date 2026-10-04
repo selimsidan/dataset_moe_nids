@@ -64,6 +64,9 @@ from .training_history import append_training_history
 CONTRACT_FILE = "run_contract.json"
 STAGE_C_SUMMARY_FILE = "stage_c_training_summary.json"
 REPRESENTATION_COVERAGE_FILE = "Representation_Batch_Coverage.csv"
+CONFUSION_ADAPTIVE_MATRIX_FILE = "Confusion_Adaptive_Matrices.csv"
+CONFUSION_ADAPTIVE_RIVAL_FILE = "Confusion_Adaptive_Rivals.csv"
+CONFUSION_ADAPTIVE_SUMMARY_FILE = "Confusion_Adaptive_Epoch_Summary.csv"
 ORCHESTRATION_TRAINING_KEYS = {
     "checkpoint_dir",
     "device",
@@ -261,6 +264,119 @@ def _write_representation_coverage(checkpoint_dir: str, class_names: list[str], 
     return path
 
 
+def _upsert_epoch_csv(frame: pd.DataFrame, path: str, epoch: int) -> None:
+    if os.path.isfile(path):
+        previous = pd.read_csv(path)
+        if "epoch" in previous:
+            previous = previous[previous["epoch"] != epoch]
+        frame = pd.concat([previous, frame], ignore_index=True)
+    if "epoch" in frame:
+        frame = frame.sort_values([column for column in ("epoch", "matrix", "true_class", "rank", "rival_class") if column in frame], kind="stable")
+    temporary = path + ".tmp"
+    frame.to_csv(temporary, index=False)
+    os.replace(temporary, path)
+
+
+def _write_confusion_adaptive_epoch(
+    checkpoint_dir: str,
+    class_names: list[str],
+    snapshot: dict[str, torch.Tensor],
+    losses: dict[str, float],
+    *,
+    proxy_active: bool,
+) -> None:
+    """Persist long-form adaptive matrices and diagnostics for one epoch."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    epoch = int(snapshot["epoch"].item())
+    support = snapshot["support"].numpy()
+    reliability = snapshot["reliability"].numpy()
+    matrix_rows = []
+    for matrix_name in ("raw", "shrunk", "ema", "margins"):
+        values = snapshot[matrix_name].numpy()
+        for true_index, true_class in enumerate(class_names):
+            for rival_index, rival_class in enumerate(class_names):
+                matrix_rows.append({
+                    "epoch": epoch,
+                    "matrix": matrix_name,
+                    "true_class": true_class,
+                    "rival_class": rival_class,
+                    "value": float(values[true_index, rival_index]),
+                    "support": int(support[true_index]),
+                    "shrinkage_reliability": float(reliability[true_index]),
+                })
+    _upsert_epoch_csv(
+        pd.DataFrame(matrix_rows),
+        os.path.join(checkpoint_dir, CONFUSION_ADAPTIVE_MATRIX_FILE),
+        epoch,
+    )
+
+    margins = snapshot["margins"].numpy()
+    ema = snapshot["ema"].numpy()
+    initialized = bool(snapshot["initialized"].item())
+    benign_index = next(
+        (index for index, name in enumerate(class_names) if name.casefold() == "benign"),
+        None,
+    )
+    rival_rows = []
+    ranking = margins.copy()
+    np.fill_diagonal(ranking, -np.inf)
+    top_indices = np.argsort(-ranking, axis=1, kind="stable")[:, :2]
+    if initialized:
+        for true_index, true_class in enumerate(class_names):
+            for rank, rival_index in enumerate(top_indices[true_index], start=1):
+                rival_rows.append({
+                    "epoch": epoch,
+                    "applies_to_epoch": epoch + 1,
+                    "true_class": true_class,
+                    "rank": rank,
+                    "rival_class": class_names[int(rival_index)],
+                    "ema_leakage": float(ema[true_index, rival_index]),
+                    "margin": float(margins[true_index, rival_index]),
+                    "is_benign_rival": bool(rival_index == benign_index),
+                })
+    _upsert_epoch_csv(
+        pd.DataFrame(rival_rows, columns=[
+            "epoch", "applies_to_epoch", "true_class", "rank", "rival_class",
+            "ema_leakage", "margin", "is_benign_rival",
+        ]),
+        os.path.join(checkpoint_dir, CONFUSION_ADAPTIVE_RIVAL_FILE),
+        epoch,
+    )
+
+    considered = [index for index in range(len(class_names)) if index != benign_index]
+    if initialized and considered and benign_index is not None:
+        benign_top1 = float(np.mean(top_indices[considered, 0] == benign_index))
+        benign_top2 = float(np.mean(np.any(top_indices[considered] == benign_index, axis=1)))
+    else:
+        benign_top1 = benign_top2 = float("nan")
+    total_margin = float(margins.sum())
+    benign_margin = float(margins[:, benign_index].sum()) if benign_index is not None else 0.0
+    weighted_metric = losses["weight"] * losses["metric"]
+    contribution = weighted_metric / losses["total"] if losses["total"] else 0.0
+    summary = pd.DataFrame([{
+        "epoch": epoch,
+        "proxy_active_during_epoch": bool(proxy_active),
+        "matrix_initialized_for_next_epoch": initialized,
+        "train_ce_loss": losses["ce"],
+        "train_proxy_margin_loss": losses["metric"],
+        "train_weighted_proxy_margin_loss": weighted_metric,
+        "train_total_loss": losses["total"],
+        "proxy_contribution_fraction": contribution,
+        "benign_top1_fraction_attack_rows": benign_top1,
+        "benign_top2_fraction_attack_rows": benign_top2,
+        "benign_margin_fraction": benign_margin / total_margin if total_margin else 0.0,
+        "global_benign_leakage": (
+            float(snapshot["global_rival"][benign_index].item())
+            if benign_index is not None else float("nan")
+        ),
+    }])
+    _upsert_epoch_csv(
+        summary,
+        os.path.join(checkpoint_dir, CONFUSION_ADAPTIVE_SUMMARY_FILE),
+        epoch,
+    )
+
+
 def shuffled_row_batches(
     start: int,
     stop: int,
@@ -426,6 +542,8 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
         epoch_started = time.monotonic()
         rng = np.random.default_rng(config.get("seed", 0) + epoch)
         encoder.train(); objective.train()
+        objective.begin_confusion_epoch(epoch + 1)
+        proxy_active = objective.confusion_proxy_active
         totals = {"ce": 0.0, "metric": 0.0, "total": 0.0}; rows_seen = 0
         report_progress = _progress_reporter(
             f"Stage A/ooc epoch {epoch + 1}", len(data.train.class_idx), progress_every
@@ -449,7 +567,8 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             features, labels, _ = _batch(data.train, row_ids, device)
             _update_representation_coverage(coverage, labels, len(data.class_names))
             optimizer.zero_grad(set_to_none=True)
-            loss, parts, _logits = objective(encoder(features), labels, weights)
+            loss, parts, logits = objective(encoder(features), labels, weights)
+            objective.accumulate_confusion(logits, labels)
             loss.backward(); optimizer.step()
             optimizer_steps += 1; examples_seen += len(row_ids)
             for name in totals:
@@ -457,10 +576,25 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             rows_seen += len(row_ids)
             report_progress(rows_seen)
         report_progress(rows_seen, force=True)
+        confusion_snapshot = objective.finalize_confusion_epoch()
+        averages = {name: totals[name] / rows_seen for name in totals}
+        representation_weight = float(
+            representation["center_weight"]
+            if representation["objective"] == "center"
+            else representation["weight"]
+        )
+        if confusion_snapshot is not None:
+            _write_confusion_adaptive_epoch(
+                checkpoint_dir,
+                data.class_names,
+                confusion_snapshot,
+                {**averages, "weight": representation_weight},
+                proxy_active=proxy_active,
+            )
         print(
             f"[Stage A/ooc] epoch {epoch + 1}: objective={objective.objective} "
-            f"CE={totals['ce'] / rows_seen:.6f} metric={totals['metric'] / rows_seen:.6f} "
-            f"total={totals['total'] / rows_seen:.6f} rows={rows_seen:,}"
+            f"CE={averages['ce']:.6f} metric={averages['metric']:.6f} "
+            f"total={averages['total']:.6f} rows={rows_seen:,}"
         )
         append_training_history(config, {
             "stage": "A", "encoder_role": encoder_role, "dataset": "ALL",
@@ -468,9 +602,14 @@ def run_stage_a_ooc(config: dict, context: OutOfCoreContext) -> SharedEncoder:
             "learning_rate": optimizer.param_groups[0]["lr"], "rows": rows_seen,
             "optimizer_steps": optimizer_steps, "examples_seen": examples_seen,
             "epoch_seconds": time.monotonic() - epoch_started,
-            "train_ce_loss": totals["ce"] / rows_seen,
-            "train_representation_loss": totals["metric"] / rows_seen,
-            "train_total_loss": totals["total"] / rows_seen,
+            "train_ce_loss": averages["ce"],
+            "train_representation_loss": averages["metric"],
+            "train_weighted_representation_loss": representation_weight * averages["metric"],
+            "train_representation_fraction": (
+                representation_weight * averages["metric"] / averages["total"]
+                if averages["total"] else 0.0
+            ),
+            "train_total_loss": averages["total"],
         })
         save_progress(checkpoint_dir, "A", {
             "epoch": epoch + 1, "encoder_state": encoder.state_dict(),

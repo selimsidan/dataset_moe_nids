@@ -44,6 +44,9 @@ from .hard_two_stage_ooc import (
 from .dense_ooc import load_dense_ooc, run_dense_stage_b_ooc, run_dense_stage_c_ooc
 from .no_fusion_ooc import load_no_fusion_ooc, run_no_fusion_ooc
 from .out_of_core_train import (
+    CONFUSION_ADAPTIVE_MATRIX_FILE,
+    CONFUSION_ADAPTIVE_RIVAL_FILE,
+    CONFUSION_ADAPTIVE_SUMMARY_FILE,
     CONTRACT_FILE,
     STAGE_C_SUMMARY_FILE,
     build_ooc_model,
@@ -63,6 +66,8 @@ def _restart(checkpoint_dir: str) -> None:
         HARD_ROUTER_FILE, HARD_CLASSIFIERS_FILE,
         HARMONIZER_FILE, CONTRACT_FILE, STAGE_C_SUMMARY_FILE,
         TRAINING_HISTORY_FILE,
+        CONFUSION_ADAPTIVE_MATRIX_FILE, CONFUSION_ADAPTIVE_RIVAL_FILE,
+        CONFUSION_ADAPTIVE_SUMMARY_FILE,
     ):
         path = os.path.join(checkpoint_dir, filename)
         if os.path.isfile(path):

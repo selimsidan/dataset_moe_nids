@@ -18,6 +18,11 @@ from training.out_of_core_data import OutOfCoreContext
 
 
 REPRESENTATION_COVERAGE_FILE = "Representation_Batch_Coverage.csv"
+CONFUSION_ADAPTIVE_REPORT_FILES = (
+    "Confusion_Adaptive_Matrices.csv",
+    "Confusion_Adaptive_Rivals.csv",
+    "Confusion_Adaptive_Epoch_Summary.csv",
+)
 
 
 def _update_roc_histograms(
@@ -240,6 +245,8 @@ def evaluate_and_report_ooc(
         expert_roc_positive = np.zeros((num_experts, num_classes, roc_bins), dtype=np.int64)
         expert_roc_negative = np.zeros((num_experts, num_classes, roc_bins), dtype=np.int64)
         gate_sum = np.zeros(num_experts, dtype=np.float64)
+        gate_entropy_sum = 0.0
+        gate_max_probability_sum = 0.0
         routing_correct = 0
         has_hard_dataset_router = False
         cursor = 0
@@ -313,6 +320,10 @@ def evaluate_and_report_ooc(
                 if num_experts:
                     gate_sum += gates.sum(axis=0)
                     utilization += np.bincount(gates.argmax(axis=1), minlength=num_experts)
+                    gate_entropy_sum += float(
+                        -(gates * np.log(np.clip(gates, 1e-12, 1.0))).sum(axis=1).sum()
+                    )
+                    gate_max_probability_sum += float(gates.max(axis=1).sum())
                 cursor += len(prediction)
         predictions.flush()
         confusion_by_origin[origin] = confusion
@@ -323,6 +334,10 @@ def evaluate_and_report_ooc(
             "origin": origin, "test_rows": amount,
             "stage_a_dataset_accuracy": (
                 float(routing_correct / amount) if has_hard_dataset_router and amount else np.nan
+            ),
+            "mean_gate_entropy": gate_entropy_sum / amount if amount and num_experts else np.nan,
+            "mean_max_gate_probability": (
+                gate_max_probability_sum / amount if amount and num_experts else np.nan
             ),
             **{
                 f"mean_gate__{expert}": float(gate_sum[i] / amount)
@@ -518,6 +533,16 @@ def evaluate_and_report_ooc(
         shutil.copy2(coverage_source, temporary)
         os.replace(temporary, coverage_report)
 
+    adaptive_reports = []
+    for filename in CONFUSION_ADAPTIVE_REPORT_FILES:
+        source = os.path.join(os.path.dirname(stage_path), filename)
+        destination = os.path.join(result_dir, filename)
+        if os.path.isfile(source):
+            temporary = destination + ".tmp"
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+            adaptive_reports.append(filename)
+
     report_files = [
         "Trials.csv", "Overall_Metrics.csv", "Per_Dataset_Metrics.csv",
         "Per_Class_Metrics.csv", "Gate_By_Dataset.csv",
@@ -526,6 +551,7 @@ def evaluate_and_report_ooc(
     ]
     if os.path.isfile(coverage_report):
         report_files.append(REPRESENTATION_COVERAGE_FILE)
+    report_files.extend(adaptive_reports)
     if reliability_frame is not None:
         report_files.append("Class_Conditional_Reliability.csv")
     manifest = {

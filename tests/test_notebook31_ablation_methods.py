@@ -230,6 +230,51 @@ def test_notebook40_balanced_supcon_changes_only_stage_a_objective():
     assert sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad) == 2_212
 
 
+def test_notebook41_confusion_margin_changes_only_stage_a_representation_method():
+    reference = yaml.safe_load(Path(
+        "config/compact_soft_moe_balanced_supcon_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    candidate = yaml.safe_load(Path(
+        "config/compact_soft_moe_confusion_adaptive_margin_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    assert reference["seeds"] == candidate["seeds"] == [0, 1, 2]
+    assert "reuse_stage_a_from_prefix" not in candidate
+    assert "reuse_stage_b_from_prefix" not in candidate
+
+    reference_backbone = copy.deepcopy(reference["backbone"])
+    candidate_backbone = copy.deepcopy(candidate["backbone"])
+    reference_representation = reference_backbone["training"].pop("representation")
+    candidate_representation = candidate_backbone["training"].pop("representation")
+    assert reference_backbone == candidate_backbone
+    assert reference_representation["objective"] == "balanced_supcon"
+    assert candidate_representation == {
+        **reference_representation,
+        "objective": "confusion_adaptive_margin",
+        "confusion_warmup_epochs": 5,
+        "confusion_ema": 0.5,
+        "confusion_shrinkage": 100.0,
+        "confusion_top_k": 2,
+        "confusion_max_margin": 0.15,
+    }
+
+    model_cfg = candidate_backbone["model"]
+    model = build_model(
+        candidate_backbone["architecture"],
+        build_encoder(47, 64, model_cfg["encoder"]),
+        ["A", "B", "C", "D"],
+        [f"class_{index}" for index in range(22)],
+        model_cfg,
+    )
+    apply_stage_c_trainability(model, candidate_backbone)
+    assert sum(parameter.numel() for parameter in model.parameters()) == 22_332
+    assert sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad) == 2_212
+
+    notebook = Path("notebooks/41_confusion_aware_margin.ipynb").read_text()
+    assert "nfv3_4way_moe_soft_balanced_supcon_deeper_gate32_frozen_stagec_v1" in notebook
+    assert "confusion_adaptive_margin" in notebook
+    assert "common paired seeds" in notebook.lower()
+
+
 def test_zero_reliability_is_exactly_the_original_probability_mixture():
     torch.manual_seed(9)
     model_cfg = {

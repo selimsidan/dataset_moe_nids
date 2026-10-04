@@ -90,12 +90,14 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
         print(f"[Stage A] resuming from epoch {start_epoch} (found existing progress checkpoint)")
 
     for epoch in range(start_epoch, config["training"]["epochs_a"]):
+        objective.begin_confusion_epoch(epoch + 1)
         totals = {"ce": 0.0, "metric": 0.0, "total": 0.0}
         n_batches = 0
         for features, class_idx, _dataset_idx in loader:
             features, class_idx = features.to(device), class_idx.to(device)
             z = encoder(features)
-            loss, parts, _logits = objective(z, class_idx)
+            loss, parts, logits = objective(z, class_idx)
+            objective.accumulate_confusion(logits, class_idx)
 
             optimizer.zero_grad()
             loss.backward()
@@ -107,6 +109,7 @@ def run_stage_a(config: dict, data: PreparedData) -> SharedEncoder:
             for name in totals:
                 totals[name] += float(parts[name].item())
             n_batches += 1
+        objective.finalize_confusion_epoch()
         print(
             f"[Stage A] epoch {epoch}: objective={objective.objective} "
             f"CE={totals['ce'] / n_batches:.4f} metric={totals['metric'] / n_batches:.4f} "
