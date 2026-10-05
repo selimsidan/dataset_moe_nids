@@ -65,6 +65,10 @@ CONFIGS = {
         "config/compact_soft_moe_balanced_supcon_frozen_deeper_gate_3seed.yaml",
         22_332,
     ),
+    "balanced_supcon_class_conditional_frozen_deeper_gate": (
+        "config/compact_soft_moe_balanced_supcon_class_conditional_frozen_deeper_gate_3seed.yaml",
+        22_420,
+    ),
 }
 
 NOTEBOOK32_CONFIGS = (
@@ -111,6 +115,7 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "class_conditional": ["C"],
         "class_conditional_frozen_deeper_gate": ["C"],
         "balanced_supcon_frozen_deeper_gate": ["A", "B", "C"],
+        "balanced_supcon_class_conditional_frozen_deeper_gate": ["C"],
     }
     for name, (path, _parameters) in CONFIGS.items():
         runner = CompactSoftMoEStudy(
@@ -275,6 +280,50 @@ def test_notebook41_confusion_margin_changes_only_stage_a_representation_method(
     assert "common paired seeds" in notebook.lower()
 
 
+def test_notebook42_combines_balanced_supcon_artifacts_with_class_conditional_stage_c():
+    reference = yaml.safe_load(Path(
+        "config/compact_soft_moe_balanced_supcon_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    candidate = yaml.safe_load(Path(
+        "config/compact_soft_moe_balanced_supcon_class_conditional_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    balanced_prefix = "nfv3_4way_moe_soft_balanced_supcon_deeper_gate32_frozen_stagec_v1"
+    assert reference["seeds"] == candidate["seeds"] == [0, 1, 2]
+    assert candidate["reuse_stage_a_from_prefix"] == balanced_prefix
+    assert candidate["reuse_stage_b_from_prefix"] == balanced_prefix
+
+    reference_backbone = copy.deepcopy(reference["backbone"])
+    candidate_backbone = copy.deepcopy(candidate["backbone"])
+    assert reference_backbone.pop("architecture") == "moe_dataset_soft"
+    assert candidate_backbone.pop("architecture") == "moe_dataset_class_conditional"
+    assert candidate_backbone["training"]["stage_c"].pop("lambda_reliability") == 0.0001
+    assert reference_backbone == candidate_backbone
+    assert candidate_backbone["training"]["representation"] == {
+        "objective": "balanced_supcon", "sampling": "legacy",
+        "class_weighting": "legacy", "weight": 0.1, "temperature": 0.1,
+        "center_weight": 0.01, "arc_margin": 0.3, "arc_scale": 30.0,
+    }
+
+    model_cfg = candidate_backbone["model"]
+    model = build_model(
+        "moe_dataset_class_conditional",
+        build_encoder(47, 64, model_cfg["encoder"]),
+        ["A", "B", "C", "D"],
+        [f"class_{index}" for index in range(22)],
+        model_cfg,
+    )
+    apply_stage_c_trainability(model, candidate_backbone)
+    assert model.class_reliability.shape == (4, 22)
+    assert torch.count_nonzero(model.class_reliability) == 0
+    assert sum(parameter.numel() for parameter in model.parameters()) == 22_420
+    assert sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad) == 2_300
+
+    notebook = Path("notebooks/42_balanced_supcon_class_conditional.ipynb").read_text()
+    assert balanced_prefix in notebook
+    assert "moe_dataset_class_conditional" in notebook
+    assert "2 × 2" in notebook
+
+
 def test_zero_reliability_is_exactly_the_original_probability_mixture():
     torch.manual_seed(9)
     model_cfg = {
@@ -428,6 +477,8 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "32_frozen_body_gate_depth_lr.ipynb",
         "40_class_conditional_frozen_deep_gate.ipynb",
         "40_balanced_supcon.ipynb",
+        "41_confusion_aware_margin.ipynb",
+        "42_balanced_supcon_class_conditional.ipynb",
     ],
 )
 def test_requested_notebooks_are_valid_and_default_to_dry_run(filename):
