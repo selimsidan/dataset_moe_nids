@@ -69,6 +69,26 @@ CONFIGS = {
         "config/compact_soft_moe_balanced_supcon_class_conditional_frozen_deeper_gate_3seed.yaml",
         22_420,
     ),
+    "balanced_supcon_class_conditional_rel1e3": (
+        "config/compact_soft_moe_balanced_supcon_class_conditional_rel1e3_frozen_deeper_gate_3seed.yaml",
+        22_420,
+    ),
+    "balanced_supcon_class_conditional_w0p05_rel1e4": (
+        "config/compact_soft_moe_balanced_supcon_class_conditional_w0p05_rel1e4_3seed.yaml",
+        22_420,
+    ),
+    "balanced_supcon_class_conditional_w0p05_rel1e3": (
+        "config/compact_soft_moe_balanced_supcon_class_conditional_w0p05_rel1e3_3seed.yaml",
+        22_420,
+    ),
+    "balanced_supcon_class_conditional_w0p20_rel1e4": (
+        "config/compact_soft_moe_balanced_supcon_class_conditional_w0p20_rel1e4_3seed.yaml",
+        22_420,
+    ),
+    "balanced_supcon_class_conditional_w0p20_rel1e3": (
+        "config/compact_soft_moe_balanced_supcon_class_conditional_w0p20_rel1e3_3seed.yaml",
+        22_420,
+    ),
 }
 
 NOTEBOOK32_CONFIGS = (
@@ -116,6 +136,11 @@ def test_ablation_checkpoint_reuse_removes_only_unchanged_stages(tmp_path):
         "class_conditional_frozen_deeper_gate": ["C"],
         "balanced_supcon_frozen_deeper_gate": ["A", "B", "C"],
         "balanced_supcon_class_conditional_frozen_deeper_gate": ["C"],
+        "balanced_supcon_class_conditional_rel1e3": ["C"],
+        "balanced_supcon_class_conditional_w0p05_rel1e4": ["A", "B", "C"],
+        "balanced_supcon_class_conditional_w0p05_rel1e3": ["A", "B", "C"],
+        "balanced_supcon_class_conditional_w0p20_rel1e4": ["A", "B", "C"],
+        "balanced_supcon_class_conditional_w0p20_rel1e3": ["A", "B", "C"],
     }
     for name, (path, _parameters) in CONFIGS.items():
         runner = CompactSoftMoEStudy(
@@ -324,6 +349,58 @@ def test_notebook42_combines_balanced_supcon_artifacts_with_class_conditional_st
     assert "2 × 2" in notebook
 
 
+def test_notebook43_is_a_staged_reliability_then_supcon_weight_study():
+    baseline = yaml.safe_load(Path(
+        "config/compact_soft_moe_balanced_supcon_class_conditional_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    reliability = yaml.safe_load(Path(
+        "config/compact_soft_moe_balanced_supcon_class_conditional_rel1e3_frozen_deeper_gate_3seed.yaml"
+    ).read_text())
+    balanced_prefix = "nfv3_4way_moe_soft_balanced_supcon_deeper_gate32_frozen_stagec_v1"
+    assert reliability["reuse_stage_a_from_prefix"] == balanced_prefix
+    assert reliability["reuse_stage_b_from_prefix"] == balanced_prefix
+
+    baseline_backbone = copy.deepcopy(baseline["backbone"])
+    reliability_backbone = copy.deepcopy(reliability["backbone"])
+    assert baseline_backbone["training"]["stage_c"].pop("lambda_reliability") == 0.0001
+    assert reliability_backbone["training"]["stage_c"].pop("lambda_reliability") == 0.001
+    assert baseline_backbone == reliability_backbone
+
+    weight_configs = {
+        (0.05, 0.0001):
+            "config/compact_soft_moe_balanced_supcon_class_conditional_w0p05_rel1e4_3seed.yaml",
+        (0.05, 0.001):
+            "config/compact_soft_moe_balanced_supcon_class_conditional_w0p05_rel1e3_3seed.yaml",
+        (0.20, 0.0001):
+            "config/compact_soft_moe_balanced_supcon_class_conditional_w0p20_rel1e4_3seed.yaml",
+        (0.20, 0.001):
+            "config/compact_soft_moe_balanced_supcon_class_conditional_w0p20_rel1e3_3seed.yaml",
+    }
+    normalized = []
+    for (weight, reliability_lambda), path in weight_configs.items():
+        study = yaml.safe_load(Path(path).read_text())
+        assert "reuse_stage_a_from_prefix" not in study
+        assert "reuse_stage_b_from_prefix" not in study
+        backbone = copy.deepcopy(study["backbone"])
+        assert backbone["training"]["representation"]["weight"] == weight
+        assert (
+            backbone["training"]["stage_c"]["lambda_reliability"]
+            == reliability_lambda
+        )
+        backbone["training"]["representation"]["weight"] = 0.1
+        backbone["training"]["stage_c"]["lambda_reliability"] = 0.0001
+        normalized.append(backbone)
+    assert all(backbone == baseline["backbone"] for backbone in normalized)
+
+    notebook = Path(
+        "notebooks/43_balanced_supcon_weight_reliability_study.ipynb"
+    ).read_text()
+    assert "validation macro-F1" in notebook
+    assert "selected_reliability" in notebook
+    assert "0.05" in notebook and "0.20" in notebook
+    assert "Locked-test descriptive metrics; never used for selection" in notebook
+
+
 def test_zero_reliability_is_exactly_the_original_probability_mixture():
     torch.manual_seed(9)
     model_cfg = {
@@ -479,6 +556,7 @@ def test_ooc_stage_b_records_owned_and_pooled_replay_exposure(tmp_path):
         "40_balanced_supcon.ipynb",
         "41_confusion_aware_margin.ipynb",
         "42_balanced_supcon_class_conditional.ipynb",
+        "43_balanced_supcon_weight_reliability_study.ipynb",
     ],
 )
 def test_requested_notebooks_are_valid_and_default_to_dry_run(filename):
@@ -490,3 +568,25 @@ def test_requested_notebooks_are_valid_and_default_to_dry_run(filename):
     assert "EXECUTE = False" in source
     assert "training.compact_soft_moe_run" in source
     assert "Final_Study_Manifest.json" in source
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "40_balanced_supcon.ipynb",
+        "40_class_conditional_frozen_deep_gate.ipynb",
+        "41_confusion_aware_margin.ipynb",
+        "42_balanced_supcon_class_conditional.ipynb",
+        "43_balanced_supcon_weight_reliability_study.ipynb",
+    ],
+)
+def test_recent_notebook_resource_reports_accept_existing_seed_columns(filename):
+    notebook = json.loads((Path("notebooks") / filename).read_text())
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert "resources.insert(0, 'seed'" not in source
+    assert (
+        "resources['seed'] = seed" in source
+        or "with_provenance(pd.read_csv(result_dir / 'Resource_Accounting.csv')" in source
+    )
