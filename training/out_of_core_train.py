@@ -1004,6 +1004,11 @@ def run_stage_c_ooc(config: dict, context: OutOfCoreContext):
         patience_left = int(progress.get("patience_left", patience_left))
         optimizer_steps = int(progress.get("optimizer_steps", 0))
         examples_seen = int(progress.get("examples_seen", 0))
+        print(
+            f"[Stage C/ooc] resuming at epoch {start_epoch + 1} "
+            f"from completed epoch {start_epoch}",
+            flush=True,
+        )
     batch_size, block_rows, buffer_blocks = _settings(config)
     progress_every = int(config["training"].get("progress_every_rows", 1_000_000))
     completed_epoch = start_epoch

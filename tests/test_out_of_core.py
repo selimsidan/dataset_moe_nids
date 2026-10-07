@@ -260,6 +260,75 @@ def test_synthetic_ooc_moe_runs_all_stages_and_reports(tmp_path, architecture):
     assert not history.duplicated(["seed", "stage", "encoder_role", "dataset", "epoch"]).any()
 
 
+def test_stage_c_resumes_from_last_completed_epoch(tmp_path, monkeypatch, capsys):
+    rng = np.random.default_rng(23)
+
+    def split(rows):
+        return PreparedSplit(
+            rng.normal(size=(rows, 6)).astype(np.float32),
+            np.tile(np.arange(4), rows // 4).astype(np.int16),
+            np.repeat(np.arange(2), rows // 2).astype(np.int16),
+            None,
+        )
+
+    train, val, test = split(64), split(32), split(32)
+    for value in (train, val, test):
+        value.dataset_slices = {
+            "A": slice(0, len(value.class_idx) // 2),
+            "B": slice(len(value.class_idx) // 2, len(value.class_idx)),
+        }
+    data = PreparedData(None, ["Benign", "c1", "c2", "c3"], ["A", "B"], train, val, test)
+    prepared = {name: SimpleNamespace(class_names=tuple(data.class_names)) for name in data.active_datasets}
+    context = OutOfCoreContext(data, prepared, {"A": "a", "B": "b"}, "prep", "unused", [f"f{i}" for i in range(6)])
+    config = {
+        "run_name": "resume-stage-c", "seed": 0, "architecture": "moe_dataset_soft",
+        "model": {
+            "latent_dim": 8,
+            "encoder": {"hidden_dims": [12], "activation": "relu", "dropout": 0.0},
+            "expert": {"hidden_dims": [8], "dropout": 0.0},
+            "gate": {"hidden_dims": [], "routing": "dense"},
+        },
+        "load_balance": {"lambda_balance": 0.1},
+        "training": {
+            "device": "cpu", "batch_size": 16, "epochs_a": 1, "epochs_b": 1,
+            "epochs_c": 2, "lr": 0.001, "weight_decay": 0.0,
+            "stage_c_unfreeze": "all", "selection_mode": "fixed_epochs",
+            "stage_c": {"gate_supervision": "none", "expert_update_policy": "all"},
+            "checkpoint_dir": str(tmp_path / "checkpoints"), "stages": ["A", "B", "C"],
+            "save_epoch_history": True, "shuffle_block_rows": 16, "shuffle_buffer_blocks": 2,
+        },
+        "evaluation": {"output_dir": str(tmp_path / "results"), "prediction_chunk_rows": 8},
+    }
+    run_stage_a_ooc(config, context)
+    run_stage_b_ooc(config, context)
+
+    import training.out_of_core_train as module
+    real_save = module.save_progress
+    interrupted = {"done": False}
+
+    def save_then_interrupt(checkpoint_dir, stage, state):
+        real_save(checkpoint_dir, stage, state)
+        if stage == "C" and not interrupted["done"]:
+            interrupted["done"] = True
+            raise RuntimeError("simulated runtime termination")
+
+    monkeypatch.setattr(module, "save_progress", save_then_interrupt)
+    with pytest.raises(RuntimeError, match="simulated runtime termination"):
+        run_stage_c_ooc(config, context)
+    progress = torch.load(tmp_path / "checkpoints" / "stage_c_progress.pt", map_location="cpu")
+    assert progress["epoch"] == 1
+
+    monkeypatch.setattr(module, "save_progress", real_save)
+    model = run_stage_c_ooc(config, context)
+    output = capsys.readouterr().out
+    history = pd.read_csv(tmp_path / "checkpoints" / "Training_History.csv")
+    stage_c = history[history["stage"] == "C"]
+    assert "resuming at epoch 2 from completed epoch 1" in output
+    assert stage_c["epoch"].tolist() == [1, 2]
+    assert model.training_summary["C"]["optimizer_steps"] == 8
+    assert not (tmp_path / "checkpoints" / "stage_c_progress.pt").exists()
+
+
 def test_two_way_configuration_builds_logical_pooled_views(tmp_path, monkeypatch):
     aliases = {f"canonical_{i}": f"F{i}" for i in range(47)}
     specs = {}

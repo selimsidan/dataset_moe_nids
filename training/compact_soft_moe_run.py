@@ -166,17 +166,8 @@ class CompactSoftMoEStudy(RecommendedPrivateStudy):
         for stage in ("A", "B", "C"):
             self._materialize_latent(seed, stage)
         self._materialize_training_report(seed)
-        if self.execute and not self._seed_complete(seed):
-            raise RuntimeError(
-                f"seed {seed} did not produce all required task, latent, and training artifacts"
-            )
         if self.execute:
-            self.state["seeds"][str(seed)] = {
-                "status": "complete",
-                "result_dir": self._result_dir(seed),
-                "completed_utc": datetime.now(timezone.utc).isoformat(),
-            }
-            self._save_state()
+            self._commit_seed_completion(seed)
 
 
 def main() -> None:
@@ -186,6 +177,7 @@ def main() -> None:
     parser.add_argument("--prefix", default="nfv3_4way_moe_soft_comparable_repro_v1")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--max-new-seeds", type=int)
+    parser.add_argument("--only-seed", type=int, choices=(0, 1, 2))
     args = parser.parse_args()
     runner = CompactSoftMoEStudy(
         base_config_path=args.config,
@@ -194,7 +186,7 @@ def main() -> None:
         execute=args.execute,
         max_new_seeds=args.max_new_seeds,
     )
-    runner.run()
+    runner.run(only_seed=args.only_seed)
 
 
 if __name__ == "__main__":

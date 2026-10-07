@@ -590,3 +590,18 @@ def test_recent_notebook_resource_reports_accept_existing_seed_columns(filename)
         "resources['seed'] = seed" in source
         or "with_provenance(pd.read_csv(result_dir / 'Resource_Accounting.csv')" in source
     )
+
+
+def test_notebook43_is_restart_safe_and_never_auto_launches_seed_two():
+    notebook = json.loads(
+        Path("notebooks/43_balanced_supcon_weight_reliability_study.ipynb").read_text()
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert "INITIAL_SEEDS = (0, 1)" in source
+    assert "RUNS_PER_SESSION = 1" in source
+    assert "CONFIRM_WEIGHT = None" in source
+    assert "--only-seed" in source
+    assert "queue[:RUNS_PER_SESSION]" in source
+    assert "if CONFIRM_WEIGHT is not None" in source

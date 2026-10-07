@@ -14,6 +14,7 @@ import os
 import pickle
 import hashlib
 import json
+import time
 
 import torch
 
@@ -35,6 +36,14 @@ def _atomic_torch_save(value, path: str) -> None:
     temporary = path + ".tmp"
     torch.save(value, temporary)
     os.replace(temporary, path)
+
+
+def _verify_torch_checkpoint(path: str) -> None:
+    """Reopen a newly committed checkpoint before its progress file is cleared."""
+    try:
+        torch.load(path, map_location="cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Checkpoint verification failed for {path}: {exc}") from exc
 
 
 def save_harmonizer(checkpoint_dir: str, harmonizer) -> None:
@@ -131,6 +140,7 @@ def save_stage_a(
     representation_config: dict | None = None,
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, STAGE_A_FILE)
     _atomic_torch_save(
         {
             "encoder_state": encoder_state,
@@ -139,8 +149,9 @@ def save_stage_a(
             "representation_state": representation_state,
             "representation_config": representation_config,
         },
-        os.path.join(checkpoint_dir, STAGE_A_FILE),
+        path,
     )
+    _verify_torch_checkpoint(path)
 
 
 def load_stage_a(checkpoint_dir: str) -> dict:
@@ -220,6 +231,7 @@ def save_stage_b(
     training_summary: dict | None = None,
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, STAGE_B_FILE)
     _atomic_torch_save(
         {
             "expert_bank_state": expert_bank_state,
@@ -227,8 +239,9 @@ def save_stage_b(
             "bank_kind": bank_kind,
             "training_summary": training_summary,
         },
-        os.path.join(checkpoint_dir, STAGE_B_FILE),
+        path,
     )
+    _verify_torch_checkpoint(path)
 
 
 def load_stage_b(checkpoint_dir: str) -> dict:
@@ -287,6 +300,7 @@ def save_stage_c(
     training_summary: dict | None = None,
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, STAGE_C_FILE)
     _atomic_torch_save(
         {
             "model_state": model_state,
@@ -295,8 +309,9 @@ def save_stage_c(
             "bank_kind": bank_kind,
             "training_summary": training_summary,
         },
-        os.path.join(checkpoint_dir, STAGE_C_FILE),
+        path,
     )
+    _verify_torch_checkpoint(path)
 
 
 def load_stage_c(checkpoint_dir: str) -> dict:
@@ -308,7 +323,15 @@ def load_stage_c(checkpoint_dir: str) -> dict:
 
 def stage_complete(checkpoint_dir: str, stage: str) -> bool:
     filename = {"A": STAGE_A_FILE, "B": STAGE_B_FILE, "C": STAGE_C_FILE}[stage]
-    return os.path.isfile(os.path.join(checkpoint_dir, filename))
+    path = os.path.join(checkpoint_dir, filename)
+    if not os.path.isfile(path):
+        return False
+    try:
+        torch.load(path, map_location="cpu")
+    except Exception as exc:
+        print(f"[checkpoint] Stage {stage} final checkpoint is unreadable: {path}: {exc}")
+        return False
+    return True
 
 
 def hard_stage_complete(checkpoint_dir: str, stage: str) -> bool:
@@ -329,7 +352,17 @@ def load_progress(checkpoint_dir: str, stage: str) -> dict | None:
     path = _progress_path(checkpoint_dir, stage)
     if not os.path.isfile(path):
         return None
-    return torch.load(path, map_location="cpu")
+    try:
+        return torch.load(path, map_location="cpu")
+    except Exception as exc:
+        quarantine = f"{path}.corrupt-{time.time_ns()}"
+        os.replace(path, quarantine)
+        print(
+            f"[checkpoint] unreadable Stage {stage} progress was quarantined at "
+            f"{quarantine}; restarting the stage from its last valid input: {exc}",
+            flush=True,
+        )
+        return None
 
 
 def clear_progress(checkpoint_dir: str, stage: str) -> None:

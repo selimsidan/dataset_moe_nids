@@ -286,7 +286,10 @@ python -m training.recommended_private_run \
 ```
 
 The runner is resumable. Use `--max-new-seeds 1` when one Colab session should
-advance only one incomplete seed. Cross-seed task, guardrail, resource,
+advance only one incomplete seed, or `--only-seed 1` to target an exact seed.
+Each seed is marked complete only after its checkpoints and required reports
+are reopened and recorded in an atomic `completion_manifest.json`; the study
+state is updated immediately afterward. Cross-seed task, guardrail, resource,
 training-history, and latent summaries are written only after seeds 0, 1, and
 2 are complete.
 
@@ -311,6 +314,12 @@ python -m training.compact_soft_moe_run \
   --study-config config/compact_soft_moe_3seed.yaml \
   --prefix nfv3_4way_moe_soft_comparable_repro_v1 \
   --execute --max-new-seeds 3
+
+# Restart-safe exact-seed execution
+python -m training.compact_soft_moe_run \
+  --study-config config/compact_soft_moe_3seed.yaml \
+  --prefix nfv3_4way_moe_soft_comparable_repro_v1 \
+  --execute --only-seed 1
 ```
 
 Ten follow-up notebooks isolate one compact-model question at a time while

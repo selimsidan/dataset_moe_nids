@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from .checkpoint import resolve_stage_a_path, resolve_stage_b_path
 from .config import load_config
 from .training_history import (
     HISTORY_COLUMNS,
@@ -61,11 +63,20 @@ TRAINING_REPORT_FILES = (
     "Training_Log_Manifest.csv",
     "Training_Report_Config.json",
 )
+COMPLETION_MANIFEST_FILE = "completion_manifest.json"
 
 
 def _hash(value: Any, length: int = 64) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()[:length]
+
+
+def _sha256_file(path: str | os.PathLike) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _format_override(value: Any) -> str:
@@ -319,6 +330,267 @@ class RecommendedPrivateStudy:
 
     def _result_dir(self, seed: int) -> str:
         return self._final_config(seed)["evaluation"]["output_dir"]
+
+    def _completion_manifest_path(self, seed: int) -> str:
+        return os.path.join(self._result_dir(seed), COMPLETION_MANIFEST_FILE)
+
+    def _seed_config_hash(self, seed: int) -> str:
+        return _hash(self._final_nested(seed, evaluate=True))
+
+    def _checkpoint_paths(self, seed: int) -> dict[str, str]:
+        config = self._final_config(seed)
+        checkpoint_dir = config["training"]["checkpoint_dir"]
+        return {
+            "A": resolve_stage_a_path(config),
+            "B": resolve_stage_b_path(config),
+            "C": os.path.join(checkpoint_dir, STAGE_C_FILE),
+        }
+
+    def _required_report_paths(self, seed: int) -> list[str]:
+        result_dir = self._result_dir(seed)
+        paths = [os.path.join(result_dir, name) for name in REQUIRED_TEST_REPORTS]
+        paths.extend(
+            os.path.join(self._training_dir(seed), name)
+            for name in TRAINING_REPORT_FILES
+        )
+        for stage in ("A", "B", "C"):
+            paths.extend(
+                os.path.join(self._latent_dir(seed, stage), name)
+                for name in LATENT_REPORT_FILES
+            )
+        cumulative = os.path.join(result_dir, "latent", "cumulative")
+        paths.extend(os.path.join(cumulative, name) for name in LATENT_REPORT_FILES)
+        return sorted(set(paths))
+
+    @staticmethod
+    def _verify_report(path: str) -> None:
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(f"Required report is missing or empty: {path}")
+        suffix = Path(path).suffix.lower()
+        try:
+            if suffix == ".json":
+                with open(path) as handle:
+                    json.load(handle)
+            elif suffix == ".csv":
+                pd.read_csv(path, nrows=1)
+            elif suffix == ".npz":
+                with np.load(path, allow_pickle=False) as archive:
+                    tuple(archive.files)
+        except Exception as exc:
+            raise RuntimeError(f"Report verification failed for {path}: {exc}") from exc
+
+    @staticmethod
+    def _verified_checkpoint(path: str) -> dict[str, Any]:
+        import torch
+
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(f"Checkpoint is missing or empty: {path}")
+        try:
+            torch.load(path, map_location="cpu")
+        except Exception as exc:
+            raise RuntimeError(f"Checkpoint verification failed for {path}: {exc}") from exc
+        return {
+            "path": path,
+            "size_bytes": os.path.getsize(path),
+            "sha256": _sha256_file(path),
+        }
+
+    def _selected_stage_c_epoch(self, seed: int) -> int | None:
+        summary_path = os.path.join(
+            self._final_config(seed)["training"]["checkpoint_dir"],
+            "stage_c_training_summary.json",
+        )
+        if os.path.isfile(summary_path):
+            with open(summary_path) as handle:
+                value = json.load(handle).get("best_epoch")
+            return None if value is None else int(value)
+        return None
+
+    def _completion_manifest_valid(self, seed: int) -> bool:
+        path = self._completion_manifest_path(seed)
+        try:
+            with open(path) as handle:
+                manifest = json.load(handle)
+            if manifest.get("format_version") != 1:
+                return False
+            if int(manifest.get("seed", -1)) != int(seed):
+                return False
+            if manifest.get("protocol_hash") != self.protocol_hash:
+                return False
+            if manifest.get("config_hash") != self._seed_config_hash(seed):
+                return False
+            checkpoints = manifest.get("checkpoints", {})
+            if set(checkpoints) != {"A", "B", "C"}:
+                return False
+            for record in checkpoints.values():
+                checkpoint_path = record["path"]
+                if not os.path.isfile(checkpoint_path):
+                    return False
+                if os.path.getsize(checkpoint_path) != int(record["size_bytes"]):
+                    return False
+                if _sha256_file(checkpoint_path) != record["sha256"]:
+                    return False
+            report_paths = manifest.get("report_paths", [])
+            if set(report_paths) != set(self._required_report_paths(seed)):
+                return False
+            for report in report_paths:
+                self._verify_report(report)
+            return True
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
+            return False
+
+    def _commit_seed_completion(self, seed: int) -> dict[str, Any]:
+        if not self._seed_artifacts_complete(seed):
+            raise RuntimeError(
+                f"seed {seed} cannot be committed: required task, latent, or training artifacts are missing"
+            )
+        checkpoints = {
+            stage: self._verified_checkpoint(path)
+            for stage, path in self._checkpoint_paths(seed).items()
+        }
+        report_paths = self._required_report_paths(seed)
+        for path in report_paths:
+            self._verify_report(path)
+        manifest = {
+            "format_version": 1,
+            "protocol_hash": self.protocol_hash,
+            "config_hash": self._seed_config_hash(seed),
+            "prefix": self.prefix,
+            "seed": int(seed),
+            "selected_stage_c_epoch": self._selected_stage_c_epoch(seed),
+            "checkpoints": checkpoints,
+            "report_paths": report_paths,
+            "completed_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        path = self._completion_manifest_path(seed)
+        _atomic_json(manifest, path)
+        with open(path) as handle:
+            if json.load(handle) != manifest:
+                raise RuntimeError(f"Completion manifest verification failed for seed {seed}")
+        if not self._completion_manifest_valid(seed):
+            raise RuntimeError(f"Completion manifest validation failed for seed {seed}")
+        self.state["seeds"][str(seed)] = {
+            "status": "complete",
+            "result_dir": self._result_dir(seed),
+            "completion_manifest": path,
+            "completed_utc": manifest["completed_utc"],
+        }
+        self._save_state()
+        print(
+            f"[commit] seed {seed}: verified checkpoints and reports; manifest={path}",
+            flush=True,
+        )
+        return manifest
+
+    def backfill_seed_completion(self, seed: int) -> bool:
+        """Commit a legacy-complete seed without rerunning any training work."""
+        if self._completion_manifest_valid(seed):
+            return True
+        if not self._seed_artifacts_complete(seed) or not self.execute:
+            return False
+        self._commit_seed_completion(seed)
+        return True
+
+    def audit_seed(self, seed: int) -> dict[str, Any]:
+        if seed not in self.study["seeds"]:
+            raise ValueError(f"seed {seed} is not part of this study")
+        checkpoint_paths = self._checkpoint_paths(seed)
+        corrupt: list[str] = []
+        if self._seed_artifacts_complete(seed) and self._completion_manifest_valid(seed):
+            return {
+                "seed": int(seed), "status": "complete", "detail": "verified completion manifest",
+                "completion_manifest": self._completion_manifest_path(seed),
+            }
+
+        progress_records = []
+        for stage in ("C", "B", "A"):
+            directory = os.path.dirname(checkpoint_paths[stage])
+            path = os.path.join(directory, f"stage_{stage.lower()}_progress.pt")
+            if not os.path.isfile(path):
+                continue
+            try:
+                record = self._verified_checkpoint(path)
+                import torch
+                state = torch.load(path, map_location="cpu")
+                record.update({
+                    "stage": stage,
+                    "epoch": int(state.get("epoch", 0)),
+                    "dataset_i": state.get("dataset_i"),
+                })
+                progress_records.append(record)
+            except RuntimeError:
+                corrupt.append(path)
+        if progress_records:
+            current = progress_records[0]
+            return {
+                "seed": int(seed), "status": "resumable",
+                "detail": f"Stage {current['stage']} completed epoch {current['epoch']}",
+                "progress": current, "corrupt_paths": corrupt,
+            }
+
+        ready = []
+        for stage in ("A", "B", "C"):
+            path = checkpoint_paths[stage]
+            if not os.path.isfile(path):
+                continue
+            try:
+                self._verified_checkpoint(path)
+                ready.append(stage)
+            except RuntimeError:
+                corrupt.append(path)
+        if ready or self._seed_artifacts_complete(seed):
+            detail = (
+                "all artifacts exist; completion manifest will be backfilled"
+                if self._seed_artifacts_complete(seed)
+                else f"valid final stage checkpoints: {','.join(ready)}"
+            )
+            return {
+                "seed": int(seed), "status": "stage-ready", "detail": detail,
+                "ready_stages": ready, "corrupt_paths": corrupt,
+            }
+        return {
+            "seed": int(seed),
+            "status": "missing/corrupt",
+            "detail": "no resumable progress or complete artifact set found",
+            "corrupt_paths": corrupt,
+        }
+
+    def create_recovery_snapshot(self, seed: int) -> str | None:
+        checkpoint_paths = self._checkpoint_paths(seed)
+        sources = set(checkpoint_paths.values())
+        for checkpoint_path in checkpoint_paths.values():
+            directory = os.path.dirname(checkpoint_path)
+            sources.update({
+                os.path.join(directory, "stage_a_progress.pt"),
+                os.path.join(directory, "stage_b_progress.pt"),
+                os.path.join(directory, "stage_c_progress.pt"),
+                os.path.join(directory, "Training_History.csv"),
+                os.path.join(directory, "stage_c_training_summary.json"),
+            })
+        sources.add(self.state_path)
+        existing = sorted(path for path in sources if os.path.isfile(path))
+        if not existing:
+            return None
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        destination = os.path.join(
+            self.summary_dir, "recovery_snapshots", f"{self.prefix}_seed{seed}_{timestamp}"
+        )
+        os.makedirs(destination, exist_ok=False)
+        copied = []
+        for index, source in enumerate(existing):
+            target = os.path.join(destination, f"{index:02d}_{os.path.basename(source)}")
+            shutil.copy2(source, target)
+            copied.append({
+                "source": source, "snapshot": target,
+                "size_bytes": os.path.getsize(target), "sha256": _sha256_file(target),
+            })
+        manifest = {
+            "format_version": 1, "prefix": self.prefix, "seed": int(seed),
+            "created_utc": datetime.now(timezone.utc).isoformat(), "files": copied,
+        }
+        _atomic_json(manifest, os.path.join(destination, "snapshot_manifest.json"))
+        print(f"[recovery] seed {seed}: snapshot={destination}", flush=True)
+        return destination
 
     def _test_complete(self, seed: int) -> bool:
         directory = self._result_dir(seed)
@@ -577,12 +849,15 @@ class RecommendedPrivateStudy:
             flush=True,
         )
 
-    def _seed_complete(self, seed: int) -> bool:
+    def _seed_artifacts_complete(self, seed: int) -> bool:
         return (
             self._test_complete(seed)
             and self._latent_seed_complete(seed)
             and self._training_complete(seed)
         )
+
+    def _seed_complete(self, seed: int) -> bool:
+        return self._seed_artifacts_complete(seed) and self._completion_manifest_valid(seed)
 
     def run_seed(self, seed: int) -> None:
         if self.execute:
@@ -615,17 +890,8 @@ class RecommendedPrivateStudy:
         else:
             self._run("locked-test", self._final_nested(seed, evaluate=True))
         self._materialize_training_report(seed)
-        if self.execute and not self._seed_complete(seed):
-            raise RuntimeError(
-                f"seed {seed} did not produce all required task, latent, and training artifacts"
-            )
         if self.execute:
-            self.state["seeds"][str(seed)] = {
-                "status": "complete",
-                "result_dir": self._result_dir(seed),
-                "completed_utc": datetime.now(timezone.utc).isoformat(),
-            }
-            self._save_state()
+            self._commit_seed_completion(seed)
 
     def aggregate(self) -> None:
         seeds = list(self.study["seeds"])
@@ -761,22 +1027,36 @@ class RecommendedPrivateStudy:
         self.state["manifest"] = os.path.join(self.summary_dir, "Final_Study_Manifest.json")
         self._save_state()
 
-    def run(self) -> None:
+    def run(self, *, only_seed: int | None = None) -> None:
+        seeds = list(self.study["seeds"])
+        if only_seed is not None:
+            if only_seed not in seeds:
+                raise ValueError(
+                    f"only_seed must be one of {seeds}; received {only_seed}"
+                )
+            seeds = [int(only_seed)]
         print(
             f"[runner] mode={'EXECUTE' if self.execute else 'DRY_RUN'} prefix={self.prefix} "
-            f"seeds={self.study['seeds']} summary_dir={self.summary_dir}",
+            f"seeds={seeds} summary_dir={self.summary_dir}",
             flush=True,
         )
         launched = 0
-        for seed in self.study["seeds"]:
+        for seed in seeds:
             print(f"[runner] seed {seed}: checking resumable artifacts", flush=True)
             incomplete = not self._seed_complete(seed)
             if self.execute and not incomplete:
-                print(f"[runner] seed {seed}: all task and latent artifacts complete", flush=True)
+                print(f"[runner] seed {seed}: verified completion manifest; skipping", flush=True)
                 continue
             if self.execute and incomplete and self.max_new_seeds is not None and launched >= self.max_new_seeds:
                 print(f"[runner] max-new-seeds={self.max_new_seeds} reached", flush=True)
                 break
+            if self.execute and incomplete:
+                status = self.audit_seed(seed)
+                print(
+                    f"[runner] seed {seed}: status={status['status']} detail={status['detail']}",
+                    flush=True,
+                )
+                self.create_recovery_snapshot(seed)
             self.run_seed(seed)
             if self.execute and incomplete:
                 launched += 1
@@ -791,6 +1071,7 @@ def main() -> None:
     parser.add_argument("--prefix", default="nfv3_4way_recommended_private_bsupcon_v1")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--max-new-seeds", type=int)
+    parser.add_argument("--only-seed", type=int, choices=(0, 1, 2))
     args = parser.parse_args()
     runner = RecommendedPrivateStudy(
         base_config_path=args.config,
@@ -799,7 +1080,7 @@ def main() -> None:
         execute=args.execute,
         max_new_seeds=args.max_new_seeds,
     )
-    runner.run()
+    runner.run(only_seed=args.only_seed)
 
 
 if __name__ == "__main__":
